@@ -319,12 +319,12 @@ class App:
                                         interpolation=cv2.INTER_AREA))
         self.cell_baseline = np.stack(crops).astype(np.int16)
 
-    def _changed_cells(self, frame) -> int:
+    def _changed_cells(self, frame, grid=None) -> int:
         """How many of the 25 cells differ from the saved round baseline."""
-        if self.grid is None or self.cell_baseline is None:
+        g = grid if grid is not None else self.grid
+        if g is None or self.cell_baseline is None:
             return 25
         crops = []
-        g = self.grid
         for r in range(5):
             for c in range(5):
                 cell = frame[g.ys[r]:g.ys[r + 1], g.xs[c]:g.xs[c + 1]]
@@ -335,6 +335,12 @@ class App:
         cur = np.stack(crops).astype(np.int16)
         diff = np.abs(cur - self.cell_baseline).mean(axis=(1, 2, 3))
         return int((diff > CELL_DIFF).sum())
+
+    @staticmethod
+    def _grid_moved(a: V.Grid, b: V.Grid) -> bool:
+        """Ignore 1-2 px jitter; treat a real move as a re-anchor."""
+        return (abs(a.x0 - b.x0) > 2 or abs(a.y0 - b.y0) > 2
+                or abs(a.x1 - b.x1) > 2 or abs(a.y1 - b.y1) > 2)
 
     def detect(self, quiet: bool = False) -> bool:
         """Find the card and lock a round. This is the only full scan."""
@@ -537,10 +543,25 @@ class App:
         if frame is None or self.grid is None or self.card is None:
             return
 
-        changed = self._changed_cells(frame)
+        # Locate the grid every check. It is cheap, and it stops 1-pixel
+        # capture jitter from looking like a whole new round. Compare the
+        # baseline at the current grid, not the old one.
+        new_grid = V.find_grid(frame)
+        grid = new_grid if new_grid is not None else self.grid
+        changed = self._changed_cells(frame, grid)
+
         if changed < ROUND_CHANGE:
             # Normal daubs/hover, or a popup just cleared. The saved card is
             # still the round. Do not OCR; do not throw anything away.
+            if new_grid is not None and self._grid_moved(self.grid, new_grid):
+                self.grid = new_grid
+                self.last_ball_crop = None
+                self.pending = None
+                self.pending_n = 0
+                self._capture_baseline(frame)
+                if (self.card_visible and self.current_cell
+                        and self.overlay_enabled):
+                    self.show_cell(*self.current_cell)
             self.last_grid_crop = frame[self.grid.y0:self.grid.y1,
                                         self.grid.x0:self.grid.x1].copy()
             if not self.card_visible:
@@ -557,10 +578,7 @@ class App:
             return
         self.last_round_ocr = now
 
-        # find_grid is cheap; OCR is the expensive part. Try to re-anchor in
-        # case the game moved or resized the card during the popup.
-        new_grid = V.find_grid(frame)
-        grid = new_grid if new_grid is not None else self.grid
+        # OCR only when the cells really changed.
         warped = V.rectify(frame, grid)
         card, scores = V.read_card(self.engine, warped)
 
