@@ -4,6 +4,12 @@ Watches the screen, reads the called ball, and dims the card except the matching
 
 Local only. No input injection, no memory reading, no DLL injection, no network.
 
+## v1.0 — manual game test passed
+
+Manually validated in the live game: card scan, one-cell highlight, previous cell
+closing on the next call, popups, boosters/powerups, and automatic new-round
+re-scan. No known bugs.
+
 ---
 
 ## Run it
@@ -129,10 +135,10 @@ at row 1, col 1. It should print `B 13 -> row 1 col 1` and the cell rect.
   without injecting input, which this tool refuses to do.
 - **Pause pauses the helper, not the game.** Pausing the game itself would need
   input injection. The game keeps running while the helper is paused.
-- **Powerups are not live-validated yet.** The round-state logic is tested
-  offline with a covered card, a moved card, and a re-dealt card. Free Daub,
-  Pick Me Up, Instant Ball, and boosters still need a real-game pass; if one
-  covers the card in an unusual way, send a screenshot.
+- **v1.0 is manually validated in the live game**, including popups,
+  boosters/powerups, and new rounds. If the game adds a new skin, powerup, or
+  layout that covers the card differently, send a screenshot and it can be
+  tuned.
 - **75-ball only** (B/I/N/G/O, 1–75). A 90-ball mode would need changes.
 - **The ball must be above the card**, as in your screenshots. If the layout
   changes, send a screenshot.
