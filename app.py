@@ -35,6 +35,11 @@ VK_F8, VK_F9, VK_F10 = 0x77, 0x78, 0x79
 WM_HOTKEY = 0x0312
 PM_REMOVE = 0x0001
 
+CELL_CMP = 48          # size used to compare one cell with its round baseline
+CELL_DIFF = 12.0       # mean per-pixel diff that counts as "this cell changed"
+ROUND_CHANGE = 12      # changed cells that mean "card covered or re-dealt"
+ROUND_CHECK = 0.3      # seconds between cheap cell-change checks
+
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -166,7 +171,6 @@ class App:
         self.pending_n = 0
         self.pending_t0 = 0.0
         self.last_ball_crop = None
-        self.last_card_time = 0.0
         self.overlay_enabled = True
         self.running = True
         self.paused = False
@@ -176,11 +180,14 @@ class App:
         self.source_image = None      # offline test: use this instead of capture
         self.dry_run = False          # offline test: never show the overlay
         self.last_grid_crop = None
-        self.last_card_check = 0.0
+        self.cell_baseline = None     # 25 cell crops from the start of the round
+        self.card_visible = False     # saved card is on screen and trusted
+        self.pending_card = None      # different card waiting for a 2nd read
+        self.pending_card_n = 0
+        self.last_round_check = 0.0
+        self.last_round_ocr = 0.0
         self.last_detect_try = 0.0
         self.detect_fail = 0
-        self.card_fail = 0
-        self.grid_miss = 0
 
     # ------------------------------------------------------------ status
 
@@ -204,7 +211,9 @@ class App:
                        and self.overlay_enabled)
 
             if frame is not None and self.grid is not None:
-                # Card changed or moved while paused? Re-detect, don't trust old.
+                # The card may have changed while we were paused. Do not throw
+                # the saved round away; hide the hole and let check_round
+                # confirm the card. A false highlight is worse than a delay.
                 crop = frame[self.grid.y0:self.grid.y1,
                              self.grid.x0:self.grid.x1]
                 diff = 999.0
@@ -212,13 +221,17 @@ class App:
                         and self.last_grid_crop.shape == crop.shape):
                     diff = float(cv2.absdiff(crop, self.last_grid_crop).mean())
                 if diff > 10.0:
-                    self._invalidate()
-                    self.status("SCANNING", "card changed - re-reading", "amber")
+                    self.current_cell = None
+                    self._set_card_visible(False)
+                    self.last_round_check = 0.0
+                    self.last_round_ocr = 0.0
+                    self.status("SCANNING", "card changed - checking", "amber")
                     print("resumed (card changed)")
                     return
 
             # Restore the last confirmed cell. If a new ball was called while
             # paused, the next poll replaces this within ~0.25 s.
+            self._set_card_visible(True)
             if restore:
                 self.show_cell(*self.current_cell)
             self.status("SCANNING", "watching for calls", "green")
@@ -259,37 +272,105 @@ class App:
     def _invalidate(self) -> None:
         self.grid = None
         self.card = None
+        self.card_scores = None
         self.last_call = None
         self.current_cell = None
         self.pending = None
         self.pending_n = 0
         self.last_ball_crop = None
         self.last_grid_crop = None
+        self.cell_baseline = None
+        self.card_visible = False
+        self.pending_card = None
+        self.pending_card_n = 0
+        self.last_round_check = 0.0
+        self.last_round_ocr = 0.0
         self.overlay.hide()
-        self.card_fail = 0
-        self.grid_miss = 0
+
+    def _set_card_visible(self, visible: bool) -> None:
+        """Track whether the saved card is on screen and trusted."""
+        if visible == self.card_visible:
+            return
+        self.card_visible = visible
+        if visible:
+            print("card visible - resuming")
+            self.status("SCANNING", "watching for calls", "green")
+            if self.current_cell is not None and self.overlay_enabled:
+                self.show_cell(*self.current_cell)
+        else:
+            print("card hidden - waiting")
+            self.overlay.hide()
+            self.status("CARD HIDDEN", "waiting for card", "amber")
+
+    def _capture_baseline(self, frame) -> None:
+        """Save the 25 cell crops from the start of the round."""
+        if self.grid is None:
+            self.cell_baseline = None
+            return
+        crops = []
+        g = self.grid
+        for r in range(5):
+            for c in range(5):
+                cell = frame[g.ys[r]:g.ys[r + 1], g.xs[c]:g.xs[c + 1]]
+                if cell.size == 0:
+                    self.cell_baseline = None
+                    return
+                crops.append(cv2.resize(cell, (CELL_CMP, CELL_CMP),
+                                        interpolation=cv2.INTER_AREA))
+        self.cell_baseline = np.stack(crops).astype(np.int16)
+
+    def _changed_cells(self, frame) -> int:
+        """How many of the 25 cells differ from the saved round baseline."""
+        if self.grid is None or self.cell_baseline is None:
+            return 25
+        crops = []
+        g = self.grid
+        for r in range(5):
+            for c in range(5):
+                cell = frame[g.ys[r]:g.ys[r + 1], g.xs[c]:g.xs[c + 1]]
+                if cell.size == 0:
+                    return 25
+                crops.append(cv2.resize(cell, (CELL_CMP, CELL_CMP),
+                                        interpolation=cv2.INTER_AREA))
+        cur = np.stack(crops).astype(np.int16)
+        diff = np.abs(cur - self.cell_baseline).mean(axis=(1, 2, 3))
+        return int((diff > CELL_DIFF).sum())
 
     def detect(self, quiet: bool = False) -> bool:
+        """Find the card and lock a round. This is the only full scan."""
         self.last_detect_try = time.time()
         if self.overlay is not None:
             self.overlay.hide()  # never let a dim rect pollute the card read
         frame = self.grab()
+        had_card = self.card is not None
+
         if frame is None:
             if not quiet:
                 print("no frame from capture")
             self.detect_fail += 1
-            self._invalidate()
-            if not quiet:
-                self.status("WAITING FOR CARD", "no capture yet", "red")
+            if had_card:
+                self._set_card_visible(False)
+                if not quiet:
+                    self.status("CARD HIDDEN", "no capture - keeping card", "amber")
+            else:
+                self._invalidate()
+                if not quiet:
+                    self.status("WAITING FOR CARD", "no capture yet", "red")
             return False
+
         grid = V.find_grid(frame)
         if grid is None:
             if not quiet:
                 print("grid not found - waiting for the card...")
             self.detect_fail += 1
-            self._invalidate()
-            if not quiet:
-                self.status("WAITING FOR CARD", "keep the game visible", "amber")
+            if had_card:
+                self._set_card_visible(False)
+                if not quiet:
+                    self.status("CARD HIDDEN", "keeping saved card", "amber")
+            else:
+                self._invalidate()
+                if not quiet:
+                    self.status("WAITING FOR CARD", "keep the game visible", "amber")
             return False
 
         warped = V.rectify(frame, grid)
@@ -300,25 +381,34 @@ class App:
             if not quiet:
                 print(f"card read rejected: {issues[:3]}")
             self.detect_fail += 1
-            self._invalidate()
-            if not quiet:
-                self.status("CARD UNREADABLE", "retrying...", "red")
+            if had_card:
+                self._set_card_visible(False)
+                if not quiet:
+                    self.status("CARD UNREADABLE", "keeping saved card", "amber")
+            else:
+                self._invalidate()
+                if not quiet:
+                    self.status("CARD UNREADABLE", "retrying...", "red")
             return False
 
+        # Valid card: lock this round. All later calls use this saved copy.
         self.grid = grid
         self.card = card
         self.card_scores = scores
-        self.last_card_time = time.time()
-        self.last_card_check = 0.0
         self.last_call = None
         self.current_cell = None
         self.pending = None
         self.pending_n = 0
         self.last_ball_crop = None
+        self.pending_card = None
+        self.pending_card_n = 0
+        self.last_round_check = 0.0
+        self.last_round_ocr = 0.0
+        self._capture_baseline(frame)
         self.last_grid_crop = frame[grid.y0:grid.y1, grid.x0:grid.x1].copy()
         self.overlay.hide()
+        self.card_visible = True
         self.detect_fail = 0
-        self.grid_miss = 0
         self.status("SCANNING", "watching for calls", "green")
 
         print(f"\ngrid: ({grid.x0},{grid.y0})-({grid.x1},{grid.y1})  "
@@ -404,15 +494,18 @@ class App:
             print(f"{letter} {num} -> NOT ON CARD  ({ms:.0f} ms)")
             self.current_cell = None
             self.overlay.hide()
-            self.status("SCANNING", f"{letter} {num} -> not on card", "green")
+            self.status("SCANNING" if self.card_visible else "CARD HIDDEN",
+                        f"{letter} {num} -> not on card",
+                        "green" if self.card_visible else "amber")
             return
 
         r, c = pos
         self.current_cell = pos
         print(f"{letter} {num} -> row {r + 1} col {c + 1}  ({ms:.0f} ms)")
-        self.status("SCANNING", f"{letter} {num} -> row {r + 1} col {c + 1}",
-                    "green")
-        if self.overlay_enabled:
+        self.status("SCANNING" if self.card_visible else "CARD HIDDEN",
+                    f"{letter} {num} -> row {r + 1} col {c + 1}",
+                    "green" if self.card_visible else "amber")
+        if self.card_visible and self.overlay_enabled:
             self.show_cell(r, c)
 
     # ------------------------------------------------------------ overlay
@@ -423,6 +516,8 @@ class App:
         return (x0, y0, g.xs[c + 1] - x0, g.ys[r + 1] - y0)
 
     def show_cell(self, r: int, c: int) -> None:
+        if not self.card_visible:
+            return
         if self.dry_run:
             print(f"overlay hole -> grid={self.grid.rect} cell={self._cell_rect(r, c)}")
             return
@@ -430,135 +525,97 @@ class App:
         if self.bar is not None:
             self.bar.raise_()
 
-    # ------------------------------------------------------------ new round
+    # ------------------------------------------------------------ round state
 
-    def refresh_card(self) -> None:
+    def check_round(self, frame) -> None:
+        """Keep the saved round. Re-read only when the card itself changes."""
         now = time.time()
-        if now - self.last_card_check < 1.5:
+        if now - self.last_round_check < ROUND_CHECK:
             return
-        self.last_card_check = now
+        self.last_round_check = now
 
-        frame = self.grab()
-        if frame is None:
-            return
-        g = self.grid
-        crop = frame[g.y0:g.y1, g.x0:g.x1]
-        if crop.size == 0:
-            return
-        if self.last_grid_crop is not None and self.last_grid_crop.shape == crop.shape:
-            diff = float(cv2.absdiff(crop, self.last_grid_crop).mean())
-        else:
-            diff = 999.0
-
-        # Whole-card change (new round) is huge; a single daub/hover is small.
-        if diff < 10.0:
-            self.last_grid_crop = crop.copy()
-            return
-        if now - self.last_card_time < 5.0:
-            return  # keep the old reference so the change is still visible later
-        self.last_card_time = now
-        self.last_grid_crop = crop.copy()
-
-        restore = self.current_cell is not None and self.overlay_enabled
-        if restore and not self.overlay.excluded:
-            self.overlay.hide()
-            time.sleep(0.05)
-
-        frame = self.grab()
-        if frame is None:
-            return
-        warped = V.rectify(frame, self.grid)
-        card, scores = V.read_card(self.engine, warped)
-
-        if V.validate_card(card):
-            # Unreadable mid-deal: force a retry instead of caching this crop.
-            self.last_grid_crop = None
-            self.card_fail += 1
-            self.overlay.hide()  # never leave a highlight we can't trust
-            self.status("CARD UNREADABLE", "retrying...", "red")
-            if self.card_fail >= 2:
-                print("\ncard lost - re-detecting")
-                self._invalidate()
-                self.status("CARD LOST", "re-scanning...", "red")
-            return
-        self.card_fail = 0
-        if card != self.card:
-            print("\ncard changed -> new round")
-            self.card = card
-            self.card_scores = scores
-            self.last_call = None
-            self.current_cell = None
-            self.pending = None
-            self.pending_n = 0
-            self.overlay.hide()
-            self.status("SCANNING", "new round", "green")
-            for row in card:
-                print("  " + " ".join(f"{v:>3}" if v is not None else "  -" for v in row))
+        if frame is None or self.grid is None or self.card is None:
             return
 
-        # Card is valid and unchanged: put back a highlight hidden for capture.
-        if restore and not self.overlay.excluded and self.current_cell:
-            self.show_cell(*self.current_cell)
-
-    # ------------------------------------------------------------ watchdog
-
-    def check_grid(self) -> None:
-        """Auto re-anchor when the card moves, resizes, or the zoom changes."""
-        if self.grid is None:
+        changed = self._changed_cells(frame)
+        if changed < ROUND_CHANGE:
+            # Normal daubs/hover, or a popup just cleared. The saved card is
+            # still the round. Do not OCR; do not throw anything away.
+            self.last_grid_crop = frame[self.grid.y0:self.grid.y1,
+                                        self.grid.x0:self.grid.x1].copy()
+            if not self.card_visible:
+                self._set_card_visible(True)
             return
-        frame = self.grab()
-        if frame is None:
+
+        # Many cells changed: a popup is covering the card, the card moved,
+        # or a new round was dealt. Never dim a popup and never guess.
+        was_visible = self.card_visible
+        self._set_card_visible(False)
+
+        cooldown = 0.6 if self.pending_card is not None else 1.0
+        if not was_visible and now - self.last_round_ocr < cooldown:
             return
+        self.last_round_ocr = now
+
+        # find_grid is cheap; OCR is the expensive part. Try to re-anchor in
+        # case the game moved or resized the card during the popup.
         new_grid = V.find_grid(frame)
-        if new_grid is None:
-            self.grid_miss += 1
-            if self.grid_miss == 2:
-                self.overlay.hide()
-                self.status("CARD LOST", "re-scanning...", "red")
-            if self.grid_miss >= 4:
-                self._invalidate()
-                self.status("WAITING FOR CARD", "keep the game visible", "amber")
-            return
-
-        self.grid_miss = 0
-        old = self.grid
-        moved = (abs(new_grid.x0 - old.x0) > 4 or abs(new_grid.y0 - old.y0) > 4
-                 or abs(new_grid.x1 - old.x1) > 4
-                 or abs(new_grid.y1 - old.y1) > 4)
-        if not moved:
-            return
-
-        # Anchor first, then read the card at the new position.
-        self.overlay.hide()
-        self.grid = new_grid
-        self.last_ball_crop = None
-        self.pending = None
-        self.pending_n = 0
-        warped = V.rectify(frame, new_grid)
+        grid = new_grid if new_grid is not None else self.grid
+        warped = V.rectify(frame, grid)
         card, scores = V.read_card(self.engine, warped)
+
         if V.validate_card(card):
-            # Old card can't be trusted at a new rect. Start over cleanly.
-            self._invalidate()
-            self.status("CARD LOST", "re-scanning...", "red")
+            # Covered, mid-deal, or unreadable. Keep the saved round and wait.
+            self.status("CARD HIDDEN", "waiting for card", "amber")
             return
 
-        changed = (card != self.card)
+        if card == self.card:
+            # Same card: it moved, was daubed a lot, or the popup cleared.
+            self.grid = grid
+            self.card_scores = scores
+            self.pending_card = None
+            self.pending_card_n = 0
+            self.last_grid_crop = frame[grid.y0:grid.y1,
+                                        grid.x0:grid.x1].copy()
+            self._capture_baseline(frame)
+            self._set_card_visible(True)  # also restores the saved cell
+            self.status("SCANNING", "watching for calls", "green")
+            return
+
+        # A different card. Confirm it once more before replacing the round:
+        # one bad read must never produce wrong highlights.
+        if card == self.pending_card:
+            self.pending_card_n += 1
+        else:
+            self.pending_card = card
+            self.pending_card_n = 1
+
+        if self.pending_card_n < 2:
+            print("different card read - confirming before switching")
+            self.status("SCANNING", "confirming new card...", "amber")
+            return
+
+        # Confirmed new round.
+        print("\nnew round -> card changed")
+        self.grid = grid
         self.card = card
         self.card_scores = scores
-        self.last_grid_crop = frame[new_grid.y0:new_grid.y1,
-                                    new_grid.x0:new_grid.x1].copy()
-        print(f"\ncard moved -> ({new_grid.x0},{new_grid.y0})-"
-              f"({new_grid.x1},{new_grid.y1})")
-        if changed:
-            self.last_call = None
-            self.current_cell = None
-            self.overlay.hide()
-            self.status("SCANNING", "new round", "green")
-            return
-
-        if self.current_cell is not None and self.overlay_enabled:
-            self.show_cell(*self.current_cell)
-        self.status("SCANNING", "card re-anchored", "green")
+        self.last_call = None
+        self.current_cell = None
+        self.pending = None
+        self.pending_n = 0
+        self.last_ball_crop = None
+        self.pending_card = None
+        self.pending_card_n = 0
+        self.last_grid_crop = frame[grid.y0:grid.y1,
+                                    grid.x0:grid.x1].copy()
+        self._capture_baseline(frame)
+        self.overlay.hide()
+        self.card_visible = True
+        self.status("SCANNING", "new round", "green")
+        for row in card:
+            print("  " + " ".join(f"{v:>3}" if v is not None else "  -" for v in row))
+        print("constraints: OK")
 
     # ------------------------------------------------------------ loop
 
@@ -607,7 +664,6 @@ class App:
         loops = 0
         polls = 0
         next_poll = time.perf_counter()
-        next_watch = time.perf_counter() + 2.0
         try:
             while self.running:
                 loops += 1
@@ -639,18 +695,12 @@ class App:
                     continue
 
                 if self.grid is None:
-                    if time.time() - self.last_detect_try > 2.0:
+                    if time.time() - self.last_detect_try > 0.6:
                         self.detect(quiet=self.detect_fail > 0)
                     time.sleep(0.05)
                     continue
 
                 now = time.perf_counter()
-                if now >= next_watch:
-                    next_watch = now + 2.0
-                    self.check_grid()
-                    if self.grid is None:
-                        continue
-
                 if now >= next_poll:
                     next_poll = now + 0.12
                     polls += 1
@@ -659,7 +709,7 @@ class App:
                     frame = self.grab()
                     if frame is not None:
                         self.poll_ball(frame)
-                        self.refresh_card()
+                        self.check_round(frame)
                 time.sleep(0.03)
         except KeyboardInterrupt:
             pass

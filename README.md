@@ -34,15 +34,34 @@ You do **not** need to keep the console open for daily use. The helper logs to
 
 ## What is automatic
 
-- **Scanning is continuous.** It does not wait for a keypress per call.
-- **Card moved / resized / zoomed?** A watchdog re-detects the grid every 2
-  seconds and re-anchors the overlay. No `F8` needed.
-- **New round?** The card change is detected and re-read automatically.
-- **Ball changes?** The region above the card is diffed ~8 times per second;
-  OCR only runs when something changed.
-- **Paused accidentally?** It keeps retrying every 2 seconds until the card is
-  readable again.
+- **Ball scanning is continuous.** It does not wait for a keypress per call.
+- **The card is locked once per round.** It stores all 25 numbers and their
+  screen cells. Calls only move the hole; the card is not re-read on every call.
+- **Popups and powerups keep the saved card.** Free Daub, Pick Me Up, Instant
+  Ball, boosters, a How-to-Play page, or any popup do not make it forget the
+  round. If the card is covered, the dark layer hides and comes back when the
+  card does.
+- **New round?** Only when the card's numbers actually change, it re-reads the
+  card. The new read is confirmed twice before replacing the old mapping, so one
+  bad OCR read cannot cause a wrong highlight.
+- **Card moved / resized / zoomed?** A big visual change triggers a re-anchor
+  automatically. `Scan` is the manual fallback.
+- **Paused accidentally?** It keeps checking quickly until the card is readable
+  again. A popup never throws the saved card away.
 - **Only one copy runs.** Launching it twice does nothing; use the bar to quit.
+
+## Round state (why popups don't break it)
+
+1. Once per round it reads the 5x5 card and stores each number plus the cell
+   rectangle on screen.
+2. Each called ball is looked up in that stored map. The overlay shows one
+   clear cell; the previous one goes back to dark.
+3. A cheap check compares the 25 cells with the start-of-round copy. A few
+   changed cells are normal daubs. Many changed cells mean the card is covered,
+   moved, or has been re-dealt.
+4. Covered card -> hide the dark layer, keep the saved round, wait.
+   Moved card -> re-anchor and keep the same numbers.
+   New numbers -> re-read, confirm, and replace the map.
 
 ## The control bar
 
@@ -70,11 +89,15 @@ The bar remembers where you dragged it (`bar_pos.txt`).
 
 ## What you will see
 
-- **Number on the card** → grid goes dark, one cell stays clear.
-  Bar: `B 13 -> row 1 col 1`
+- **Number on the card** → the 5x5 grid goes dark, one cell stays clear.
+  Bar: `B 13 -> row 1 col 1`. On the next called number, the old cell goes
+  back to dark and the new one opens.
 - **Number not on the card** → no overlay (nothing is hidden).
   Bar: `B 5 -> not on card`
-- **New round** → card change is detected automatically and re-read.
+- **Popup / powerup covering the card** → the dark layer hides, the saved round
+  stays in memory, and the layer returns when the card is visible again.
+- **New round** → the changed numbers are re-read and confirmed automatically.
+- The B/I/N/G/O header row is **not** darkened; only the 5x5 playing cells are.
 
 ## If something is wrong
 
@@ -106,14 +129,19 @@ at row 1, col 1. It should print `B 13 -> row 1 col 1` and the cell rect.
   without injecting input, which this tool refuses to do.
 - **Pause pauses the helper, not the game.** Pausing the game itself would need
   input injection. The game keeps running while the helper is paused.
-- **Real-game validation is still pending.** The vision path is tested on two
-  screenshots at two scales; auto re-anchoring is tested by shifting a
-  screenshot. A different skin may need a new screenshot from you.
+- **Powerups are not live-validated yet.** The round-state logic is tested
+  offline with a covered card, a moved card, and a re-dealt card. Free Daub,
+  Pick Me Up, Instant Ball, and boosters still need a real-game pass; if one
+  covers the card in an unusual way, send a screenshot.
 - **75-ball only** (B/I/N/G/O, 1–75). A 90-ball mode would need changes.
 - **The ball must be above the card**, as in your screenshots. If the layout
   changes, send a screenshot.
-- **A pause banner covering the card** makes the card unreadable. The helper
-  hides the overlay and retries; it recovers when the banner goes away.
+- **A pause banner or popup covering the card** makes the card unreadable. The
+  helper hides the overlay, keeps the saved round, and recovers when the banner
+  goes away. It will not re-scan the card just because a popup appeared.
+- **One cell at a time.** If a powerup calls several balls quickly (Instant
+  Ball), the newest interpreted call is the one shown; you may need to daub the
+  earlier ones yourself. This is the simple, safe behavior we chose.
 - It captures the visible screen with DXGI. Nothing is recorded or saved unless
   you run the test commands.
 
@@ -121,7 +149,7 @@ at row 1, col 1. It should print `B 13 -> row 1 col 1` and the cell rect.
 
 | File | Purpose |
 |------|---------|
-| `app.py` | Live loop: capture, detect, poll ball, overlay, watchdog, control bar |
+| `app.py` | Live loop: capture, one card scan per round, ball polling, round-state check, overlay, control bar |
 | `controls.py` | Always-on-top no-focus control bar (Scan / Pause / Quit) |
 | `overlay.py` | Topmost click-through per-pixel-alpha window |
 | `vision.py` | Grid, card, ball, OCR, validation |
