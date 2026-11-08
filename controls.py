@@ -56,7 +56,7 @@ NULL_BRUSH = 5
 NULL_PEN = 8
 TRANSPARENT = 1
 
-W, H = 560, 150
+W, H = 520, 70
 
 HDC = wintypes.HDC
 HWND = wintypes.HWND
@@ -255,8 +255,8 @@ class ControlBar:
         self._drag_off = (0, 0)
         self._x = 0
         self._y = 0
-        self._font_bold = self._make_font(-22, 700)
-        self._font_small = self._make_font(-16, 500)
+        self._font_bold = self._make_font(-15, 650)
+        self._font_small = self._make_font(-12, 450)
         self._arrow = user32.LoadCursorW(None, ctypes.c_void_p(IDC_ARROW))
         self._hand = user32.LoadCursorW(None, ctypes.c_void_p(IDC_HAND))
         self._register()
@@ -289,7 +289,7 @@ class ControlBar:
 
         user32.SetWindowDisplayAffinity(self._hwnd, WDA_EXCLUDEFROMCAPTURE)
 
-        rgn = gdi32.CreateRoundRectRgn(0, 0, W + 1, H + 1, 24, 24)
+        rgn = gdi32.CreateRoundRectRgn(0, 0, W + 1, H + 1, 14, 14)
         if rgn:
             if not user32.SetWindowRgn(self._hwnd, rgn, True):
                 gdi32.DeleteObject(rgn)
@@ -372,9 +372,9 @@ class ControlBar:
 
     def _buttons(self):
         return {
-            "scan": (36, 106, 140, 42),
-            "pause": (192, 106, 160, 42),
-            "quit": (368, 106, 156, 42),
+            "scan": (326, 20, 64, 30),
+            "pause": (396, 20, 60, 30),
+            "quit": (462, 20, 44, 30),
         }
 
     def _hit(self, x: int, y: int):
@@ -483,7 +483,7 @@ class ControlBar:
         null_pen = gdi32.GetStockObject(NULL_PEN)
         old_pen = gdi32.SelectObject(target, null_pen)
         old_brush = gdi32.SelectObject(target, dot)
-        gdi32.Ellipse(target, 14, 28, 44, 58)
+        gdi32.Ellipse(target, 20, 26, 38, 44)
         gdi32.SelectObject(target, old_pen)
         gdi32.SelectObject(target, old_brush)
         gdi32.DeleteObject(dot)
@@ -491,23 +491,23 @@ class ControlBar:
         gdi32.SetBkMode(target, TRANSPARENT)
         old_font = gdi32.SelectObject(target, self._font_bold)
         gdi32.SetTextColor(target, rgb(238, 238, 244))
-        r1 = RECT(30, 16, W - 20, 52)
+        r1 = RECT(50, 10, 306, 30)
         user32.DrawTextW(target, self._line1, -1, ctypes.byref(r1),
                         DT_LEFT | DT_SINGLELINE | DT_VCENTER
                         | DT_END_ELLIPSIS | DT_NOPREFIX)
 
         gdi32.SelectObject(target, self._font_small)
         gdi32.SetTextColor(target, rgb(170, 170, 184))
-        r2 = RECT(30, 54, W - 20, 88)
+        r2 = RECT(50, 30, 306, 56)
         user32.DrawTextW(target, self._line2, -1, ctypes.byref(r2),
                         DT_LEFT | DT_SINGLELINE | DT_VCENTER
                         | DT_END_ELLIPSIS | DT_NOPREFIX)
 
-        # separator between status and buttons
+        # separator between status and controls
         sep_pen = gdi32.CreatePen(0, 1, rgb(58, 58, 72))
         old_pen = gdi32.SelectObject(target, sep_pen)
-        gdi32.MoveToEx(target, 20, 96, None)
-        gdi32.LineTo(target, W - 20, 96)
+        gdi32.MoveToEx(target, 316, 14, None)
+        gdi32.LineTo(target, 316, 56)
         gdi32.SelectObject(target, old_pen)
         gdi32.DeleteObject(sep_pen)
 
@@ -517,7 +517,7 @@ class ControlBar:
             "quit": "Quit",
         }
 
-        gdi32.SelectObject(target, self._font_bold)
+        gdi32.SelectObject(target, self._font_small)
         for name, (bx, by, bw, bh) in self._buttons().items():
             if self._pressed == name:
                 fill = rgb(82, 82, 98)
@@ -528,8 +528,13 @@ class ControlBar:
             else:
                 fill = rgb(36, 36, 46)
             brush = gdi32.CreateSolidBrush(fill)
-            br = RECT(bx, by, bx + bw, by + bh)
-            user32.FillRect(target, ctypes.byref(br), brush)
+            edge = gdi32.CreatePen(0, 1, rgb(66, 66, 82))
+            old_pen = gdi32.SelectObject(target, edge)
+            old_brush = gdi32.SelectObject(target, brush)
+            gdi32.RoundRect(target, bx, by, bx + bw, by + bh, 8, 8)
+            gdi32.SelectObject(target, old_pen)
+            gdi32.SelectObject(target, old_brush)
+            gdi32.DeleteObject(edge)
             gdi32.DeleteObject(brush)
 
             gdi32.SetTextColor(target, rgb(236, 236, 242))
@@ -611,7 +616,7 @@ if __name__ == "__main__":
 
     # simulate a click on the Pause button
     time.sleep(0.4)
-    lp = (28 << 16) | (260 & 0xFFFF)
+    lp = (30 << 16) | (420 & 0xFFFF)
     user32.PostMessageW(bar._hwnd, WM_LBUTTONDOWN, 0, lp)
     user32.PostMessageW(bar._hwnd, WM_LBUTTONUP, 0, lp)
 

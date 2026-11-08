@@ -6,6 +6,17 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.7
+
+v1.7 replaces the oversized bar with a professional compact HUD strip:
+
+- **Status left, controls right.** A clear vertical separator splits the live
+  status from the buttons.
+- **Compact bar body.** No giant bar or oversized buttons.
+- **Clean controls.** `Scan`, `Pause`/`Resume`, and `Quit` are normal-sized,
+  rounded buttons.
+- **Same no-focus behavior.**
+
 ## Version 1.6
 
 v1.6 improves the on-screen control bar:
@@ -189,7 +200,9 @@ The helper does **not** activate the powerup and does **not** pick for you.
 
 ## The control bar
 
-A larger, always-on-top control bar sits above the taskbar (drag it anywhere):
+A compact, professional control bar sits above the taskbar (drag it anywhere).
+The live status is on the left, a separator divides it from the controls, and
+the buttons stay normal sized:
 
 | Button | Action |
 |--------|--------|
