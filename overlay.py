@@ -2,7 +2,7 @@
 
 Pure Win32 via ctypes. No Qt, no Tk, no focus stealing.
 The window covers exactly the grid rectangle: black with alpha everywhere,
-fully transparent inside the target cell's rectangle.
+fully transparent inside one or more target cells (Instant Ball shows three).
 """
 from __future__ import annotations
 
@@ -215,7 +215,13 @@ class Overlay:
         gdi32.SelectObject(self._mem_dc, self._hbitmap)
         self._size = (w, h)
 
-    def show(self, grid_rect, hole_rect=None, dim_alpha: int = 220) -> None:
+    def show(self, grid_rect, hole_rect=None, dim_alpha: int = 220,
+             holes=None) -> None:
+        """Dim the grid except one or more transparent holes.
+
+        ``hole_rect`` is kept for the old one-hole calls; ``holes`` accepts a
+        list of (x, y, w, h) rectangles for Instant Ball.
+        """
         gx, gy, gw, gh = (int(v) for v in grid_rect)
         if gw <= 0 or gh <= 0:
             return
@@ -224,8 +230,12 @@ class Overlay:
         buf = np.zeros((gh, gw, 4), np.uint8)
         buf[:, :, 3] = dim_alpha  # black, semi-transparent
 
-        if hole_rect is not None:
-            hx, hy, hw, hh = (int(v) for v in hole_rect)
+        if holes is None:
+            holes = [hole_rect] if hole_rect is not None else []
+        for hole in holes:
+            if hole is None:
+                continue
+            hx, hy, hw, hh = (int(v) for v in hole)
             lx = max(0, hx - gx)
             ly = max(0, hy - gy)
             rx = min(gw, lx + hw)

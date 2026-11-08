@@ -4,6 +4,8 @@ Everything here is pure computer vision. No capture, no overlay, no game access.
 """
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 from dataclasses import dataclass
@@ -93,9 +95,13 @@ def find_header(img):
         x1 = max(c[0] + c[2] for c in g)
         if x1 - x0 < 200:
             continue
-        if best is None or (x1 - x0) > best[0]:
-            best = (x1 - x0, x0, min(c[1] for c in g), x1,
-                    max(c[1] + c[3] for c in g))
+        # Prefer the full five-letter header. A row of brightly daubed cells
+        # can also form a wide group; the real header is above it and has all
+        # five blocks. This is what kept Instant Ball cards from being found.
+        y0 = min(c[1] for c in g)
+        score = (len(g), x1 - x0, -y0)
+        if best is None or score > best[0]:
+            best = (score, x0, y0, x1, max(c[1] + c[3] for c in g))
     if best is None:
         return None
     return best[1], best[2], best[3], best[4]
@@ -259,31 +265,87 @@ def ocr(engine, img, scale: float = 1.0):
     return str(txts[0]), float(scores[0]) if scores else 0.0
 
 
-def read_card(engine, warped, size: int = CANON):
+def is_free_cell(cell, min_ratio: float = 0.28) -> bool:
+    """True when a cell is the orange pumpkin/free-space artwork.
+
+    The centre free space is skipped before this is called.  A few event cards
+    show a second free/wild cell; it must count as marked or every bingo answer
+    after it is wrong.  The check is deliberately visual, not "OCR failed",
+    so a genuinely unreadable number cannot silently become a free cell.
+    """
+    hsv = cv2.cvtColor(cell, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    orange = ((h >= 5) & (h <= 32) & (s >= 90) & (v >= 90))
+    return float(orange.mean()) >= min_ratio
+
+
+def read_card_ex(engine, warped, size: int = CANON):
+    """Read the 5x5 card and also report visually confirmed free/wild cells."""
     values = [[None] * 5 for _ in range(5)]
     scores = [[0.0] * 5 for _ in range(5)]
+    free = [[False] * 5 for _ in range(5)]
+    free[2][2] = True  # standard 75-ball FREE space
     for r in range(5):
         for c in range(5):
             if r == 2 and c == 2:
-                continue  # standard 75-ball FREE space
-            txt, sc = ocr(engine, cell_img(warped, r, c, size=size))
+                continue
+            cell = cell_img(warped, r, c, size=size)
+            txt, sc = ocr(engine, cell)
             digits = "".join(ch for ch in txt if ch.isdigit())
             if 1 <= len(digits) <= 2:
                 v = int(digits)
                 if 1 <= v <= 75:
                     values[r][c] = v
                     scores[r][c] = sc
+                    continue
+            if is_free_cell(cell):
+                free[r][c] = True
+    return values, scores, free
+
+
+def read_card(engine, warped, size: int = CANON):
+    """Backward-compatible two-value card reader."""
+    values, scores, _ = read_card_ex(engine, warped, size=size)
     return values, scores
+
+
+def detect_daubed_cells(warped, free, size: int = CANON,
+                        strong: float = 0.55,
+                        weak: float = 0.30):
+    """Read already-daubed cells when the helper starts mid-round.
+
+    A daub fills the cell with saturated colour; normal number cells are white
+    with dark text, so the fraction is near 0 or near 1.  ``weak`` marks the
+    ambiguous middle range, which makes Pick Me Up choose manually instead of
+    guessing.
+    """
+    daubed, ambiguous = set(), False
+    for r in range(5):
+        for c in range(5):
+            if free[r][c]:
+                continue
+            cell = cell_img(warped, r, c, size=size)
+            ratio = cell_saturation(cell)
+            if ratio >= strong:
+                daubed.add((r, c))
+            elif ratio >= weak:
+                ambiguous = True
+    return daubed, ambiguous
+
+
+def cell_saturation(cell) -> float:
+    """Fraction of a cell that is strongly saturated (the daub fill)."""
+    if cell is None or cell.size == 0:
+        return 0.0
+    hsv = cv2.cvtColor(cell, cv2.COLOR_BGR2HSV)
+    sat = ((hsv[:, :, 1] > 90) & (hsv[:, :, 2] > 70))
+    return float(sat.mean())
 
 
 # ---------------------------------------------------------------- ball
 
-def find_ball(img, grid: Grid):
-    """Largest saturated, roughly-circular blob above the grid = current ball.
-
-    Colour-agnostic on purpose: B/I/N/G/O balls use five different hues, and
-    the call history shows smaller balls of the same hues.
-    """
+def _ball_candidates_color(img, grid: Grid):
+    """Old saturation-blob fallback, used only if Hough finds nothing."""
     h, w = img.shape[:2]
     x0 = max(0, grid.x0 - 30)
     x1 = min(w, grid.x1 + 30)
@@ -295,7 +357,7 @@ def find_ball(img, grid: Grid):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     n, _, st, _ = cv2.connectedComponentsWithStats(mask, 8)
     cell = grid.width / 5.0
-    best = None
+    out = []
     for i in range(1, n):
         bx, by, bw, bh, area = st[i]
         if area < 200:
@@ -304,12 +366,85 @@ def find_ball(img, grid: Grid):
             continue
         if bw < 0.35 * cell or bh < 0.35 * cell:
             continue
-        # Largest wins; on a tie the right-most wins (current ball sits right
-        # of the call history, which can use the same ball size).
-        score = (bw * bh, bx)
-        if best is None or score > best[0]:
-            best = (score, int(bx + x0), int(by + y0), int(bw), int(bh))
-    return best[1:] if best else None
+        out.append((int(bx + x0), int(by + y0), int(bw), int(bh), int(area)))
+    return out
+
+
+def _ball_candidates(img, grid: Grid):
+    """Plausible current/history balls above the grid.
+
+    Hough circles keep working when Instant Ball draws a coloured banner
+    behind the balls; a saturation blob would merge all three into one wide
+    shape.  The old colour method is retained as a fallback.
+    """
+    h, w = img.shape[:2]
+    x0 = max(0, grid.x0 - 30)
+    x1 = min(w, grid.x1 + 30)
+    y0 = max(0, grid.y0 - int(grid.width * 0.85))
+    y1 = max(1, grid.y0)
+    if x1 - x0 < 40 or y1 - y0 < 40:
+        return []
+    roi = img[y0:y1, x0:x1]
+    gray = cv2.medianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), 5)
+    rh, rw = roi.shape[:2]
+    cell = grid.width / 5.0
+    min_r = max(10, int(0.20 * cell))
+    max_r = max(min_r + 4, int(0.80 * cell))
+    circles = cv2.HoughCircles(
+        gray, cv2.HOUGH_GRADIENT, dp=1.2,
+        minDist=max(10, int(0.35 * cell)),
+        param1=100, param2=30,
+        minRadius=min_r, maxRadius=max_r)
+    out = []
+    if circles is not None:
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        sat = ((hsv[:, :, 1] > 90) & (hsv[:, :, 2] > 70))
+        for cx, cy, r in circles[0]:
+            cx, cy, r = int(cx), int(cy), int(r)
+            if cx - r < 0 or cy - r < 0 or cx + r > rw or cy + r > rh:
+                continue
+            yy, xx = np.ogrid[:rh, :rw]
+            disk = (xx - cx) ** 2 + (yy - cy) ** 2 <= (0.80 * r) ** 2
+            if not disk.any() or float(sat[disk].mean()) < 0.10:
+                continue
+            out.append((int(cx - r + x0), int(cy - r + y0),
+                        int(2 * r), int(2 * r), int(3.14 * r * r)))
+    if out:
+        return out
+    return _ball_candidates_color(img, grid)
+
+
+def find_ball(img, grid: Grid):
+    """Largest saturated, roughly-circular blob above the grid = current ball.
+
+    Colour-agnostic on purpose: B/I/N/G/O balls use five different hues, and
+    the call history shows smaller balls of the same hues.
+    """
+    cands = _ball_candidates(img, grid)
+    if not cands:
+        return None
+    # Largest wins; on a tie the right-most wins (current ball sits right of
+    # the call history, which can use the same ball size).
+    best = max(cands, key=lambda c: (c[2] * c[3], c[0]))
+    return best[:4]
+
+
+def find_balls(img, grid: Grid, max_balls: int = 3):
+    """Return the large, current ball cluster above the grid.
+
+    Instant Ball shows 2-3 large balls at the same time.  Call-history balls
+    are smaller, so keeping only blobs near the largest radius separates the
+    current call(s) from history.  Normal play usually returns one ball.
+    """
+    cands = _ball_candidates(img, grid)
+    if not cands:
+        return []
+    max_r = max(c[2] / 2 for c in cands)
+    keep = [c for c in cands if c[2] / 2 >= 0.68 * max_r]
+    keep.sort(key=lambda c: (c[2] * c[3], c[0]), reverse=True)
+    keep = keep[:max_balls]
+    keep.sort(key=lambda c: c[0])
+    return [c[:4] for c in keep]
 
 
 def _row_bands(th):
@@ -343,7 +478,13 @@ def _row_bands(th):
     return bands or [(0, len(zero))]
 
 
-def read_ball(engine, img, bbox):
+def read_ball(engine, img, bbox, fast: bool = False):
+    """Read a ball.  fast=True skips the letter OCR.
+
+    The letter is fully determined by the number's B/I/N/G/O range, so the
+    letter read is redundant.  Skipping it saves ~50 ms per ball, which matters
+    when Instant Ball shows three balls at once.
+    """
     x, y, w, h = bbox
     cx, cy = x + w // 2, y + h // 2
     r = min(w, h) // 2
@@ -363,6 +504,9 @@ def read_ball(engine, img, bbox):
     th[:, -m:] = 0
 
     bands = _row_bands(th)
+    two_bands = len(bands) >= 2
+    if fast and two_bands:
+        bands = bands[1:]  # bottom band is the number
     letter, letter_sc = "", 0.0
     number, number_sc = None, 0.0
 
@@ -381,7 +525,7 @@ def read_ball(engine, img, bbox):
         txt, sc = ocr(engine, crop, scale=6.0)
         t = txt.strip()
 
-        is_top = idx == 0 and len(bands) >= 2
+        is_top = (not fast) and idx == 0 and two_bands
         if is_top:
             if t.upper() in LETTERS and len(t) == 1:
                 letter, letter_sc = t.upper(), sc
@@ -390,12 +534,141 @@ def read_ball(engine, img, bbox):
         digits = "".join(ch for ch in t if ch.isdigit())
         if 1 <= len(digits) <= 2:
             number, number_sc = int(digits), sc
-        elif len(bands) == 1 and t.upper() in LETTERS and len(t) == 1:
+        elif not two_bands and t.upper() in LETTERS and len(t) == 1:
             # single band that turned out to be a letter, not a number
             letter, letter_sc = t.upper(), sc
 
     return {"letter": letter, "letter_score": letter_sc,
             "number": number, "number_score": number_sc}
+
+
+def read_ball_robust(engine, img, bbox, min_score: float = 0.90):
+    """Read a ball whose Hough box may be slightly too large.
+
+    Instant Ball can draw a coloured banner that makes Hough pick a wider
+    circle.  Try a few centred shrink factors; only accept a non-default
+    scale when at least two scales agree on the same number.  A missed read is
+    better than reading half a number as a different ball.
+    """
+    x, y, w, h = bbox
+    cx, cy = x + w // 2, y + h // 2
+    votes: dict[int, tuple[int, float]] = {}
+    for f in (1.0, 0.92, 0.85, 0.78, 0.70):
+        nw, nh = max(4, int(w * f)), max(4, int(h * f))
+        bb = (cx - nw // 2, cy - nh // 2, nw, nh)
+        ball = read_ball(engine, img, bb, fast=True)
+        num = ball["number"]
+        if num is None or not (1 <= num <= 75) or ball["number_score"] < min_score:
+            continue
+        count, best = votes.get(num, (0, 0.0))
+        votes[num] = (count + 1, max(best, ball["number_score"]))
+        if f == 1.0:
+            return ball  # unshrunk read is the safest
+    if not votes:
+        return {"letter": "", "letter_score": 0.0,
+                "number": None, "number_score": 0.0}
+    num, (count, best) = max(votes.items(), key=lambda kv: (kv[1][0], kv[1][1]))
+    if count < 2:
+        return {"letter": "", "letter_score": 0.0,
+                "number": None, "number_score": 0.0}
+    return {"letter": "", "letter_score": 0.0,
+            "number": num, "number_score": best}
+
+
+# ---------------------------------------------------------------- power-up popups
+
+def find_pink_band(img):
+    """Locate the wide pink/red title strip used by Pick Me Up."""
+    h, w = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    # Coral/pink sits at the red end of the hue wheel in OpenCV (0-179).
+    mask = (((hue >= 155) | (hue <= 8)) & (sat >= 70) & (val >= 100))
+    mask = (mask * 255).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    n, _, st, _ = cv2.connectedComponentsWithStats(mask, 8)
+    best = None
+    for i in range(1, n):
+        x, y, bw, bh, area = st[i]
+        if bw < 0.12 * w or bh < 14 or bh > 0.25 * h:
+            continue
+        if bw / max(bh, 1) < 2.5:
+            continue
+        if area < 0.004 * w * h:
+            continue
+        score = (bw, area)
+        if best is None or score > best[0]:
+            best = (score, int(x), int(y), int(bw), int(bh))
+    return best[1:] if best else None
+
+
+def find_popup_title(engine, img):
+    """Return (title_bbox, text) when the screen is the Pick Me Up popup."""
+    band = find_pink_band(img)
+    if band is None:
+        return None
+    x, y, w, h = band
+    H, W = img.shape[:2]
+    pad = max(4, int(0.04 * h))
+    crop = img[max(0, y - pad):min(H, y + h + pad),
+               max(0, x - pad):min(W, x + w + pad)]
+    if crop.size == 0:
+        return None
+    txt, _ = ocr(engine, crop, scale=2.0)
+    norm = "".join(ch for ch in txt.upper() if ch.isalnum())
+    if "PICKMEUP" in norm or ("PICK" in norm and "UP" in norm):
+        return band, txt.strip()
+    return None
+
+
+def find_popup_balls(img, region, max_balls: int = 4):
+    """Find the large circular offered balls inside a Pick Me Up popup.
+
+    Hough circles work here where colour contours do not: the coloured coffee
+    cup touches two of the balls, so a saturation blob merges them into one
+    shape.  The balls are clean circles with a white rim, and Hough finds all
+    four at once.  If it cannot, the caller shows "choose manually" rather
+    than guessing.
+    """
+    H, W = img.shape[:2]
+    x0, y0, x1, y1 = (int(v) for v in region)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(W, x1), min(H, y1)
+    if x1 - x0 < 60 or y1 - y0 < 60:
+        return []
+    roi = img[y0:y1, x0:x1]
+    gray = cv2.medianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), 5)
+    rh, rw = roi.shape[:2]
+    min_r = max(12, int(0.035 * rw))
+    max_r = max(min_r + 4, int(0.09 * rw))
+    circles = cv2.HoughCircles(
+        gray, cv2.HOUGH_GRADIENT, dp=1.2,
+        minDist=max(20, int(0.10 * rw)),
+        param1=100, param2=30,
+        minRadius=min_r, maxRadius=max_r)
+    if circles is None:
+        return []
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    sat = ((hsv[:, :, 1] > 90) & (hsv[:, :, 2] > 70))
+    out = []
+    for cx, cy, r in circles[0]:
+        cx, cy, r = int(cx), int(cy), int(r)
+        if cx - r < 0 or cy - r < 0 or cx + r > rw or cy + r > rh:
+            continue
+        yy, xx = np.ogrid[:rh, :rw]
+        disk = (xx - cx) ** 2 + (yy - cy) ** 2 <= (0.82 * r) ** 2
+        color_ratio = float(sat[disk].mean()) if disk.any() else 0.0
+        if color_ratio < 0.12:
+            continue
+        out.append((int(cx - r + x0), int(cy - r + y0), int(2 * r), int(2 * r),
+                    color_ratio))
+    if not out:
+        return []
+    out.sort(key=lambda b: b[4], reverse=True)
+    out = out[:max_balls]
+    out.sort(key=lambda b: (b[1], b[0]))
+    return [b[:4] for b in out]
 
 
 # ---------------------------------------------------------------- rules
@@ -407,11 +680,14 @@ def letter_for(n: int) -> Optional[str]:
     return None
 
 
-def validate_card(values):
+def validate_card(values, free=None):
+    if free is None:
+        free = [[False] * 5 for _ in range(5)]
+        free[2][2] = True
     issues, seen = [], {}
     for r in range(5):
         for c in range(5):
-            if r == 2 and c == 2:
+            if free[r][c]:
                 continue
             v = values[r][c]
             if v is None:

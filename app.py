@@ -25,9 +25,12 @@ from ctypes import wintypes
 import cv2
 import numpy as np
 
+import bingo as B
 import vision as V
 from controls import ControlBar
 from overlay import Overlay
+
+VERSION = "1.1"
 
 logging.disable(logging.INFO)
 
@@ -37,8 +40,13 @@ PM_REMOVE = 0x0001
 
 CELL_CMP = 48          # size used to compare one cell with its round baseline
 CELL_DIFF = 12.0       # mean per-pixel diff that counts as "this cell changed"
+DAUB_DIFF = 18.0       # stronger diff that confirms a real daub
+DAUB_SAT = 0.40        # daub fill must also cover this much of the cell
 ROUND_CHANGE = 12      # changed cells that mean "card covered or re-dealt"
 ROUND_CHECK = 0.3      # seconds between cheap cell-change checks
+POPUP_RETRY = 0.5      # seconds between failed Pick Me Up title reads
+BALL_SCORE = 0.90      # minimum OCR confidence for a normal ball
+INSTANT_SCORE = 0.92   # minimum OCR confidence for an Instant Ball number
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -165,8 +173,13 @@ class App:
         self.grid: V.Grid | None = None
         self.card = None
         self.card_scores = None
-        self.last_call: tuple[str, int] | None = None
-        self.current_cell: tuple[int, int] | None = None
+        self.free_cells: set[tuple[int, int]] = {(2, 2)}
+        self.daubed = B.initial_daubed()
+        self.line_counts = B.line_counts(self.daubed)
+        self.last_calls: set[tuple[str, int]] = set()
+        self.current_cells: list[tuple[int, int]] = []
+        self.instant_cells: set[tuple[int, int]] = set()
+        self.pending_cells: dict[tuple[int, int], float] = {}
         self.pending: tuple[str, int] | None = None
         self.pending_n = 0
         self.pending_t0 = 0.0
@@ -188,6 +201,10 @@ class App:
         self.last_round_ocr = 0.0
         self.last_detect_try = 0.0
         self.detect_fail = 0
+        self.popup = None             # cached Pick Me Up result
+        self.last_popup_check = 0.0
+        self.last_popup_text = ""
+        self.initial_uncertain = False
 
     # ------------------------------------------------------------ status
 
@@ -207,7 +224,7 @@ class App:
             self.last_ball_crop = None
             self.pending = None
             frame = self.grab()
-            restore = (self.grid is not None and self.current_cell is not None
+            restore = (self.grid is not None and bool(self.current_cells)
                        and self.overlay_enabled)
 
             if frame is not None and self.grid is not None:
@@ -221,7 +238,7 @@ class App:
                         and self.last_grid_crop.shape == crop.shape):
                     diff = float(cv2.absdiff(crop, self.last_grid_crop).mean())
                 if diff > 10.0:
-                    self.current_cell = None
+                    self.current_cells = []
                     self._set_card_visible(False)
                     self.last_round_check = 0.0
                     self.last_round_ocr = 0.0
@@ -229,11 +246,11 @@ class App:
                     print("resumed (card changed)")
                     return
 
-            # Restore the last confirmed cell. If a new ball was called while
+            # Restore the last confirmed cells. If a new ball was called while
             # paused, the next poll replaces this within ~0.25 s.
             self._set_card_visible(True)
             if restore:
-                self.show_cell(*self.current_cell)
+                self.show_cells(*self.current_cells)
             self.status("SCANNING", "watching for calls", "green")
             print("resumed")
 
@@ -273,8 +290,13 @@ class App:
         self.grid = None
         self.card = None
         self.card_scores = None
-        self.last_call = None
-        self.current_cell = None
+        self.free_cells = {(2, 2)}
+        self.daubed = B.initial_daubed()
+        self.line_counts = B.line_counts(self.daubed)
+        self.last_calls.clear()
+        self.current_cells = []
+        self.instant_cells.clear()
+        self.pending_cells.clear()
         self.pending = None
         self.pending_n = 0
         self.last_ball_crop = None
@@ -285,6 +307,8 @@ class App:
         self.pending_card_n = 0
         self.last_round_check = 0.0
         self.last_round_ocr = 0.0
+        self.popup = None
+        self.initial_uncertain = False
         self.overlay.hide()
 
     def _set_card_visible(self, visible: bool) -> None:
@@ -295,8 +319,8 @@ class App:
         if visible:
             print("card visible - resuming")
             self.status("SCANNING", "watching for calls", "green")
-            if self.current_cell is not None and self.overlay_enabled:
-                self.show_cell(*self.current_cell)
+            if self.current_cells and self.overlay_enabled:
+                self.show_cells(*self.current_cells)
         else:
             print("card hidden - waiting")
             self.overlay.hide()
@@ -319,22 +343,178 @@ class App:
                                         interpolation=cv2.INTER_AREA))
         self.cell_baseline = np.stack(crops).astype(np.int16)
 
-    def _changed_cells(self, frame, grid=None) -> int:
-        """How many of the 25 cells differ from the saved round baseline."""
+    def _cell_diffs(self, frame, grid=None) -> list[float]:
+        """Per-cell difference from the saved round baseline (25 values)."""
         g = grid if grid is not None else self.grid
         if g is None or self.cell_baseline is None:
-            return 25
+            return [999.0] * 25
         crops = []
         for r in range(5):
             for c in range(5):
                 cell = frame[g.ys[r]:g.ys[r + 1], g.xs[c]:g.xs[c + 1]]
                 if cell.size == 0:
-                    return 25
+                    return [999.0] * 25
                 crops.append(cv2.resize(cell, (CELL_CMP, CELL_CMP),
                                         interpolation=cv2.INTER_AREA))
         cur = np.stack(crops).astype(np.int16)
         diff = np.abs(cur - self.cell_baseline).mean(axis=(1, 2, 3))
-        return int((diff > CELL_DIFF).sum())
+        return [float(v) for v in diff]
+
+    def _changed_cells(self, frame, grid=None) -> int:
+        """How many of the 25 cells differ from the saved round baseline."""
+        return sum(1 for d in self._cell_diffs(frame, grid) if d > CELL_DIFF)
+
+    def _reset_daubed(self, free=None) -> None:
+        """Start a fresh round's authoritative daub matrix."""
+        if free is not None:
+            self.free_cells = {(r, c) for r in range(5) for c in range(5)
+                               if free[r][c]}
+        else:
+            self.free_cells = {(2, 2)}
+        self.daubed = B.initial_daubed(self.free_cells)
+        self.line_counts = B.line_counts(self.daubed)
+
+    def _seed_daubs(self, warped, free) -> set[tuple[int, int]]:
+        """Reset the round and read daubs already on screen.
+
+        This is what lets the helper start in the middle of a round without
+        pretending the board is fresh.  Ambiguous colour makes Pick Me Up
+        choose manually for that round.
+        """
+        self._reset_daubed(free)
+        daubed, ambiguous = V.detect_daubed_cells(warped, free)
+        for r, c in daubed:
+            self.daubed[r][c] = True
+        self.line_counts = B.line_counts(self.daubed)
+        self.initial_uncertain = ambiguous
+        return daubed
+
+    def _mark_daubed(self, r: int, c: int) -> bool:
+        if self.daubed[r][c]:
+            return False
+        self.daubed[r][c] = True
+        self.line_counts = B.line_counts(self.daubed)
+        return True
+
+    def _apply_daubs(self, diffs, frame=None) -> list[tuple[int, int]]:
+        """Advance the daub matrix for cells that really changed.
+
+        Card pixels are the source of truth. A highlight is only provisional;
+        this is what makes the bingo/Pick Me Up answer correct.
+        """
+        new = []
+        for i, d in enumerate(diffs):
+            if d < DAUB_DIFF:
+                continue
+            r, c = divmod(i, 5)
+            # A popup or hover can change a cell without daubing it. Real
+            # daubs in this game fill the cell with saturated colour.
+            if frame is not None and self._cell_saturation(frame, r, c) < DAUB_SAT:
+                continue
+            if self._mark_daubed(r, c):
+                new.append((r, c))
+            self.pending_cells.pop((r, c), None)
+            self.instant_cells.discard((r, c))
+            if (r, c) in self.current_cells:
+                self.current_cells.remove((r, c))
+        if new:
+            names = B.completed_lines(self.daubed)
+            print("daub confirmed: " + ", ".join(f"r{r + 1}c{c + 1}"
+                                                 for r, c in new)
+                  + (f"  [{len(names)} BINGO]" if names else ""))
+            if self.card_visible and self.overlay_enabled:
+                if self.current_cells:
+                    self.show_cells(*self.current_cells)
+                else:
+                    self.overlay.hide()
+        return new
+
+    def _cell_diff(self, frame, r: int, c: int, grid=None) -> float:
+        g = grid if grid is not None else self.grid
+        if g is None or self.cell_baseline is None:
+            return 999.0
+        cell = frame[g.ys[r]:g.ys[r + 1], g.xs[c]:g.xs[c + 1]]
+        if cell.size == 0:
+            return 999.0
+        cur = cv2.resize(cell, (CELL_CMP, CELL_CMP),
+                         interpolation=cv2.INTER_AREA).astype(np.int16)
+        return float(np.abs(cur - self.cell_baseline[r * 5 + c]).mean())
+
+    def _cell_saturation(self, frame, r: int, c: int, grid=None) -> float:
+        g = grid if grid is not None else self.grid
+        if g is None:
+            return 0.0
+        cell = frame[g.ys[r]:g.ys[r + 1], g.xs[c]:g.xs[c + 1]]
+        return V.cell_saturation(cell)
+
+    def _cell_saturation_from_last_crop(self, r: int, c: int) -> float:
+        g, crop = self.grid, self.last_grid_crop
+        if g is None or crop is None:
+            return 0.0
+        if crop.shape[:2] != (g.y1 - g.y0, g.x1 - g.x0):
+            return 0.0
+        cell = crop[g.ys[r] - g.y0:g.ys[r + 1] - g.y0,
+                    g.xs[c] - g.x0:g.xs[c + 1] - g.x0]
+        return V.cell_saturation(cell)
+
+    def _cell_diff_from_last_crop(self, r: int, c: int) -> float:
+        """Check a cell in the last frame that still showed the card."""
+        g = self.grid
+        crop = self.last_grid_crop
+        if g is None or crop is None or self.cell_baseline is None:
+            return 999.0
+        if crop.shape[:2] != (g.y1 - g.y0, g.x1 - g.x0):
+            return 999.0
+        ly0, ly1 = g.ys[r] - g.y0, g.ys[r + 1] - g.y0
+        lx0, lx1 = g.xs[c] - g.x0, g.xs[c + 1] - g.x0
+        cell = crop[ly0:ly1, lx0:lx1]
+        if cell.size == 0:
+            return 999.0
+        cur = cv2.resize(cell, (CELL_CMP, CELL_CMP),
+                         interpolation=cv2.INTER_AREA).astype(np.int16)
+        return float(np.abs(cur - self.cell_baseline[r * 5 + c]).mean())
+
+    def _confirm_pending(self, frame) -> None:
+        """Fast visual confirmation of the cell(s) we just highlighted."""
+        if (not self.pending_cells or not self.card_visible
+                or self.popup is not None or self.grid is None):
+            return
+        # If the card is covered or re-dealt, a popup pixel would look like a
+        # daub.  Only confirm a pending cell while the rest of the card still
+        # matches its round baseline.
+        diffs = self._cell_diffs(frame)
+        if sum(1 for d in diffs if d > CELL_DIFF) >= ROUND_CHANGE:
+            return
+        for pos in list(self.pending_cells):
+            r, c = pos
+            diff = self._cell_diff(frame, r, c)
+            if (diff >= DAUB_DIFF
+                    and self._cell_saturation(frame, r, c) >= DAUB_SAT):
+                self._mark_daubed(r, c)
+                self.pending_cells.pop(pos, None)
+                self.instant_cells.discard(pos)
+                if pos in self.current_cells:
+                    self.current_cells.remove(pos)
+                print(f"daub confirmed: r{r + 1}c{c + 1}")
+                if self.overlay_enabled:
+                    if self.current_cells:
+                        self.show_cells(*self.current_cells)
+                    else:
+                        self.overlay.hide()
+
+    def _confirm_pending_from_last_crop(self) -> None:
+        """Use the last card frame before a popup covered it."""
+        for pos in list(self.pending_cells):
+            r, c = pos
+            if (self._cell_diff_from_last_crop(r, c) >= DAUB_DIFF
+                    and self._cell_saturation_from_last_crop(r, c) >= DAUB_SAT):
+                self._mark_daubed(r, c)
+                self.pending_cells.pop(pos, None)
+                self.instant_cells.discard(pos)
+
+    def _bingo_suffix(self) -> str:
+        names = B.completed_lines(self.daubed)
+        return f" | {len(names)} BINGO" if names else ""
 
     @staticmethod
     def _grid_moved(a: V.Grid, b: V.Grid) -> bool:
@@ -380,8 +560,8 @@ class App:
             return False
 
         warped = V.rectify(frame, grid)
-        card, scores = V.read_card(self.engine, warped)
-        issues = V.validate_card(card)
+        card, scores, free = V.read_card_ex(self.engine, warped)
+        issues = V.validate_card(card, free)
         if issues:
             # A wrong card means wrong highlights. Never accept one.
             if not quiet:
@@ -401,8 +581,11 @@ class App:
         self.grid = grid
         self.card = card
         self.card_scores = scores
-        self.last_call = None
-        self.current_cell = None
+        initial_daubs = self._seed_daubs(warped, free)
+        self.last_calls.clear()
+        self.current_cells = []
+        self.instant_cells.clear()
+        self.pending_cells.clear()
         self.pending = None
         self.pending_n = 0
         self.last_ball_crop = None
@@ -410,6 +593,8 @@ class App:
         self.pending_card_n = 0
         self.last_round_check = 0.0
         self.last_round_ocr = 0.0
+        self.popup = None
+        self.last_popup_check = 0.0
         self._capture_baseline(frame)
         self.last_grid_crop = frame[grid.y0:grid.y1, grid.x0:grid.x1].copy()
         self.overlay.hide()
@@ -421,6 +606,15 @@ class App:
               f"{grid.width}x{grid.height}")
         for row in card:
             print("  " + " ".join(f"{v:>3}" if v is not None else "  -" for v in row))
+        extra_free = sorted(self.free_cells - {(2, 2)})
+        if extra_free:
+            print("extra free/wild: " + ", ".join(f"r{r + 1}c{c + 1}"
+                                                  for r, c in extra_free))
+        if initial_daubs:
+            print("already daubed: " + ", ".join(f"r{r + 1}c{c + 1}"
+                                                  for r, c in sorted(initial_daubs)))
+        if self.initial_uncertain:
+            print("daub state ambiguous - Pick Me Up will ask manually")
         print("constraints: OK")
         return True
 
@@ -440,6 +634,8 @@ class App:
                       xs=[x - dx for x in g.xs], ys=[y - dy for y in g.ys])
 
     def poll_ball(self, frame) -> None:
+        if not self.card_visible or self.popup is not None:
+            return
         x0, y0, x1, y1 = self._ball_region(frame)
         crop = frame[y0:y1, x0:x1]
         if crop.size == 0:
@@ -453,17 +649,38 @@ class App:
             return
         self.last_ball_crop = crop.copy()
 
-        bbox = V.find_ball(crop, self._sub_grid(x0, y0))
-        if bbox is None:
+        # A pink popup title over a mostly covered card means Pick Me Up (or
+        # another modal). Do not read its offered balls as called balls; let
+        # check_round process the popup. Instant Ball also has a pink banner,
+        # but its card is still visible, so changed stays low.
+        if (V.find_pink_band(frame) is not None
+                and self._changed_cells(frame) >= ROUND_CHANGE):
+            return
+
+        bboxes = V.find_balls(crop, self._sub_grid(x0, y0), max_balls=3)
+        if not bboxes:
             self.pending = None
             self.pending_n = 0
             self.last_ball_crop = None  # keep looking every poll
             return
-        bbox = (bbox[0] + x0, bbox[1] + y0, bbox[2], bbox[3])
+        bboxes = [(b[0] + x0, b[1] + y0, b[2], b[3]) for b in bboxes]
 
+        # Instant Ball shows two or three large balls at once.  Do not make
+        # the user wait for a second confirming read; these balls disappear.
+        # Before treating a multi-ball frame as Instant Ball, rule out Pick Me
+        # Up: its four offered balls can otherwise look like free balls and
+        # produce a wrong highlight.
+        if len(bboxes) >= 2:
+            self.last_popup_check = 0.0
+            if self._check_pick_me_up(frame):
+                return
+            self._poll_instant(frame, bboxes)
+            return
+
+        bbox = bboxes[0]
         ball = V.read_ball(self.engine, frame, bbox)
         num = ball["number"]
-        if num is None or not (1 <= num <= 75) or ball["number_score"] < 0.90:
+        if num is None or not (1 <= num <= 75) or ball["number_score"] < BALL_SCORE:
             self.last_ball_crop = None  # retry the read, keep any pending call
             return
         letter = ball["letter"]
@@ -476,6 +693,10 @@ class App:
             letter = derived or "?"
 
         key = (letter, num)
+        if key in self.last_calls:
+            self.pending = None
+            self.pending_n = 0
+            return
         if key == self.pending:
             self.pending_n += 1
         else:
@@ -484,21 +705,75 @@ class App:
             self.pending_t0 = time.perf_counter()
         if self.pending_n < 2:
             return
-        if key == self.last_call:
-            self.pending_n = 0
-            return
 
-        self.last_call = key
+        self.last_calls.add(key)
         self.pending_n = 0
         self.commit(letter, num)
+
+    def _poll_instant(self, frame, bboxes) -> None:
+        """Read all large balls and show all matching holes together."""
+        found = []
+        unread = 0
+        for bbox in bboxes:
+            ball = V.read_ball_robust(self.engine, frame, bbox,
+                                      min_score=INSTANT_SCORE)
+            num = ball["number"]
+            if (num is None or not (1 <= num <= 75)
+                    or ball["number_score"] < INSTANT_SCORE):
+                unread += 1
+                continue
+            letter = V.letter_for(num) or "?"
+            key = (letter, num)
+            if key in self.last_calls:
+                continue
+            if any(k == key for k, _, _ in found):
+                continue
+            pos = V.locate_number(self.card, num)
+            if pos is None:
+                print(f"instant {letter} {num} -> NOT ON CARD")
+                continue
+            r, c = pos
+            if self.daubed[r][c]:
+                continue
+            found.append((letter, num, pos))
+
+        if not found:
+            if unread:
+                self.last_ball_crop = None
+            return
+
+        now = time.time()
+        for letter, num, pos in found:
+            self.last_calls.add((letter, num))
+            self.pending_cells[pos] = now
+        self.pending = None
+        self.pending_n = 0
+        # Keep holes from an earlier partial Instant read while this powerup
+        # is still on screen; a later frame must not hide a ball that was
+        # already shown just because OCR caught the remaining one now.
+        merged = {pos for pos in self.instant_cells
+                  if not self.daubed[pos[0]][pos[1]]}
+        merged |= {pos for _, _, pos in found}
+        self.instant_cells = merged
+        self.current_cells = sorted(merged)
+        summary = " ".join(f"{letter}{num}" for letter, num, _ in found)
+        print(f"INSTANT BALL: {summary}")
+        suffix = self._bingo_suffix()
+        self.status("INSTANT BALL", summary + suffix, "green")
+        self.show_cells(*self.current_cells)
+        if unread:
+            # Allow a later frame to pick up any ball that failed OCR.
+            self.last_ball_crop = None
 
     def commit(self, letter: str, num: int) -> None:
         ms = (time.perf_counter() - self.pending_t0) * 1000 if self.pending_t0 else 0.0
         self.pending_t0 = 0.0
+        self.instant_cells.clear()
         pos = V.locate_number(self.card, num)
+        self.last_calls.add((letter, num))
         if pos is None:
             print(f"{letter} {num} -> NOT ON CARD  ({ms:.0f} ms)")
-            self.current_cell = None
+            self.current_cells = []
             self.overlay.hide()
             self.status("SCANNING" if self.card_visible else "CARD HIDDEN",
                         f"{letter} {num} -> not on card",
@@ -506,13 +781,24 @@ class App:
             return
 
         r, c = pos
-        self.current_cell = pos
+        if self.daubed[r][c]:
+            print(f"{letter} {num} -> r{r + 1}c{c + 1} already daubed")
+            self.current_cells = []
+            self.overlay.hide()
+            self.status("SCANNING" if self.card_visible else "CARD HIDDEN",
+                        f"{letter} {num} -> already daubed",
+                        "green" if self.card_visible else "amber")
+            return
+
+        self.current_cells = [pos]
+        self.pending_cells[pos] = time.time()
         print(f"{letter} {num} -> row {r + 1} col {c + 1}  ({ms:.0f} ms)")
+        suffix = self._bingo_suffix()
         self.status("SCANNING" if self.card_visible else "CARD HIDDEN",
-                    f"{letter} {num} -> row {r + 1} col {c + 1}",
+                    f"{letter} {num} -> r{r + 1}c{c + 1}{suffix}",
                     "green" if self.card_visible else "amber")
         if self.card_visible and self.overlay_enabled:
-            self.show_cell(r, c)
+            self.show_cells(*self.current_cells)
 
     # ------------------------------------------------------------ overlay
 
@@ -521,17 +807,174 @@ class App:
         x0, y0 = g.xs[c], g.ys[r]
         return (x0, y0, g.xs[c + 1] - x0, g.ys[r + 1] - y0)
 
-    def show_cell(self, r: int, c: int) -> None:
+    def show_cells(self, *cells) -> None:
         if not self.card_visible:
             return
-        if self.dry_run:
-            print(f"overlay hole -> grid={self.grid.rect} cell={self._cell_rect(r, c)}")
+        clean = []
+        for r, c in cells:
+            if (r, c) not in clean and not self.daubed[r][c]:
+                clean.append((r, c))
+        self.current_cells = clean
+        if not clean:
+            self.overlay.hide()
             return
-        self.overlay.show(self.grid.rect, self._cell_rect(r, c), dim_alpha=235)
+        if self.dry_run:
+            print("overlay holes -> grid=" + str(self.grid.rect) + " cells="
+                  + str([self._cell_rect(r, c) for r, c in clean]))
+            return
+        holes = [self._cell_rect(r, c) for r, c in clean]
+        self.overlay.show(self.grid.rect, holes=holes, dim_alpha=235)
         if self.bar is not None:
             self.bar.raise_()
 
+    def show_cell(self, r: int, c: int) -> None:
+        self.show_cells((r, c))
+
     # ------------------------------------------------------------ round state
+
+    def _check_pick_me_up(self, frame) -> bool:
+        """Detect and rank Pick Me Up without ever guessing on a bad read."""
+        if self.popup is not None:
+            # The popup stays static; do not OCR four balls every 0.3 s.
+            # Check only that its pink title strip is still there.  Without
+            # this, a closed popup plus many daubs would look like a large
+            # change forever and the card would never come back.
+            title = self.popup.get("title")
+            band = V.find_pink_band(frame)
+            if title is None or band is None or self._rect_iou(band, title) < 0.20:
+                print("popup gone")
+                self.popup = None
+                return False
+            return True
+        if self.card is None:
+            return False
+        now = time.time()
+        if now - self.last_popup_check < POPUP_RETRY:
+            return False
+        self.last_popup_check = now
+
+        found = V.find_popup_title(self.engine, frame)
+        if not found:
+            return False
+        title, txt = found
+        print(f"popup: {txt!r}")
+        self._set_card_visible(False)
+        H, W = frame.shape[:2]
+        bx, by, bw, bh = title
+        pad = max(12, int(0.12 * bw))
+        region = (bx - pad, by + bh - 10, bx + bw + pad,
+                  min(H, by + bh + int(1.9 * bw)))
+        bboxes = V.find_popup_balls(frame, region, max_balls=4)
+
+        offers, details = [], []
+        for bbox in bboxes:
+            ball = V.read_ball(self.engine, frame, bbox)
+            num = ball["number"]
+            if (num is None or not (1 <= num <= 75)
+                    or ball["number_score"] < INSTANT_SCORE):
+                ball = V.read_ball_robust(self.engine, frame, bbox,
+                                          min_score=INSTANT_SCORE)
+                num = ball["number"]
+            if (num is None or not (1 <= num <= 75)
+                    or ball["number_score"] < INSTANT_SCORE):
+                continue
+            letter = ball["letter"]
+            derived = V.letter_for(num)
+            if letter and derived != letter:
+                print(f"PICK ME UP reject: {letter} {num}, range says {derived}")
+                continue
+            if not letter:
+                letter = derived or "?"
+            if num in offers:
+                continue
+            offers.append(num)
+            details.append((letter, num, round(ball["number_score"], 3)))
+        print(f"PICK ME UP offers: {offers}  {details}")
+
+        # Use the last visible card frame to settle any highlight that was
+        # still pending when the popup appeared.
+        self._confirm_pending_from_last_crop()
+        self.current_cells = []
+        self.instant_cells.clear()
+        self.overlay.hide()
+
+        if self.initial_uncertain:
+            self.popup = {"offers": tuple(offers), "best": None, "manual": True,
+                          "reason": "daub state uncertain", "t": now,
+                          "title": title}
+            self.status("PICK ME UP", "daub state uncertain - manual", "amber")
+            print("PICK ME UP: daub state uncertain - manual")
+            return True
+
+        if len(offers) < 4:
+            self.popup = {"offers": tuple(offers), "best": None, "manual": True,
+                          "reason": "could not read 4 balls", "t": now,
+                          "title": title}
+            self.status("PICK ME UP", "read failed - choose manually", "amber")
+            print("PICK ME UP: fewer than 4 balls read - manual")
+            return True
+
+        choices = B.rank_picks(self.card, self.daubed, offers)
+        for line in B.format_ranking(choices):
+            print("  " + line)
+        if not choices:
+            self.popup = {"offers": tuple(offers), "best": None, "manual": True,
+                          "reason": "none on card", "choices": choices, "t": now,
+                          "title": title}
+            self.status("PICK ME UP", "none on card - choose manually", "amber")
+            return True
+
+        uncertain = False
+        pending = [pos for pos in self.pending_cells
+                   if not self.daubed[pos[0]][pos[1]]]
+        if pending:
+            alt = [row[:] for row in self.daubed]
+            for r, c in pending:
+                alt[r][c] = True
+            alt_choices = B.rank_picks(self.card, alt, offers)
+            top = choices[0].number
+            alt_top = alt_choices[0].number if alt_choices else None
+            if top != alt_top:
+                uncertain = True
+                print(f"PICK ME UP: unconfirmed daub changes best "
+                      f"({top} vs {alt_top})")
+
+        top_score = choices[0].score
+        ties = [p for p in choices if p.score == top_score]
+        if len(ties) > 1:
+            names = "/".join(str(p.number) for p in ties)
+            self.popup = {"offers": tuple(offers), "best": None, "manual": True,
+                          "reason": "tie", "choices": choices, "t": now,
+                          "title": title}
+            self.status("PICK ME UP", f"tie {names} - choose manually", "amber")
+            print("PICK ME UP: tie -> manual")
+            return True
+        if uncertain:
+            self.popup = {"offers": tuple(offers), "best": None, "manual": True,
+                          "reason": "unconfirmed daub",
+                          "choices": choices, "t": now, "title": title}
+            self.status("PICK ME UP", "last call unconfirmed - manual", "amber")
+            return True
+
+        best = choices[0]
+        self.popup = {"offers": tuple(offers), "best": best.number,
+                      "manual": False, "choices": choices, "t": now,
+                      "title": title}
+        self.status("PICK ME UP", B.format_choice(best), "green")
+        print(f"PICK ME UP -> {best.number} at r{best.row + 1}c{best.col + 1}")
+        return True
+
+    @staticmethod
+    def _rect_iou(a, b) -> float:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        x0, y0 = max(ax, bx), max(ay, by)
+        x1, y1 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        inter = (x1 - x0) * (y1 - y0)
+        union = aw * ah + bw * bh - inter
+        return inter / union if union > 0 else 0.0
 
     def check_round(self, frame) -> None:
         """Keep the saved round. Re-read only when the card itself changes."""
@@ -548,20 +991,31 @@ class App:
         # baseline at the current grid, not the old one.
         new_grid = V.find_grid(frame)
         grid = new_grid if new_grid is not None else self.grid
-        changed = self._changed_cells(frame, grid)
+        diffs = self._cell_diffs(frame, grid)
+        changed = sum(1 for d in diffs if d > CELL_DIFF)
+        moved = (new_grid is not None and self._grid_moved(self.grid, new_grid))
 
         if changed < ROUND_CHANGE:
             # Normal daubs/hover, or a popup just cleared. The saved card is
             # still the round. Do not OCR; do not throw anything away.
-            if new_grid is not None and self._grid_moved(self.grid, new_grid):
+            if self.popup is not None:
+                # The pink band can survive a mostly-visible card; verify
+                # before treating popup pixels as daubs.
+                if self._check_pick_me_up(frame):
+                    return
+                print("popup cleared")
+                self.popup = None
+            if not moved:
+                self._apply_daubs(diffs, frame)
+            if moved:
                 self.grid = new_grid
                 self.last_ball_crop = None
                 self.pending = None
                 self.pending_n = 0
                 self._capture_baseline(frame)
-                if (self.card_visible and self.current_cell
+                if (self.card_visible and self.current_cells
                         and self.overlay_enabled):
-                    self.show_cell(*self.current_cell)
+                    self.show_cells(*self.current_cells)
             self.last_grid_crop = frame[self.grid.y0:self.grid.y1,
                                         self.grid.x0:self.grid.x1].copy()
             if not self.card_visible:
@@ -573,6 +1027,11 @@ class App:
         was_visible = self.card_visible
         self._set_card_visible(False)
 
+        # Pick Me Up is the only popup we guide.  If this is not it, fall
+        # through to the existing card-change check.
+        if self._check_pick_me_up(frame):
+            return
+
         cooldown = 0.6 if self.pending_card is not None else 1.0
         if not was_visible and now - self.last_round_ocr < cooldown:
             return
@@ -580,24 +1039,37 @@ class App:
 
         # OCR only when the cells really changed.
         warped = V.rectify(frame, grid)
-        card, scores = V.read_card(self.engine, warped)
+        card, scores, free = V.read_card_ex(self.engine, warped)
 
-        if V.validate_card(card):
+        if V.validate_card(card, free):
             # Covered, mid-deal, or unreadable. Keep the saved round and wait.
             self.status("CARD HIDDEN", "waiting for card", "amber")
             return
 
         if card == self.card:
             # Same card: it moved, was daubed a lot, or the popup cleared.
+            # Only trust daub pixels when the grid did not move; a moved grid
+            # makes the old baseline noisy, and a false daub is worse than a
+            # missed one.
+            if not moved:
+                self._apply_daubs(diffs, frame)
+            new_free = {(r, c) for r in range(5) for c in range(5)
+                        if free[r][c]}
+            if new_free - self.free_cells:
+                self.free_cells |= new_free
+                for r, c in new_free:
+                    self._mark_daubed(r, c)
             self.grid = grid
             self.card_scores = scores
             self.pending_card = None
             self.pending_card_n = 0
+            self.popup = None
             self.last_grid_crop = frame[grid.y0:grid.y1,
                                         grid.x0:grid.x1].copy()
             self._capture_baseline(frame)
-            self._set_card_visible(True)  # also restores the saved cell
-            self.status("SCANNING", "watching for calls", "green")
+            self._set_card_visible(True)  # also restores the saved cells
+            self.status("SCANNING", "watching for calls" + self._bingo_suffix(),
+                        "green")
             return
 
         # A different card. Confirm it once more before replacing the round:
@@ -618,13 +1090,17 @@ class App:
         self.grid = grid
         self.card = card
         self.card_scores = scores
-        self.last_call = None
-        self.current_cell = None
+        initial_daubs = self._seed_daubs(warped, free)
+        self.last_calls.clear()
+        self.current_cells = []
+        self.instant_cells.clear()
+        self.pending_cells.clear()
         self.pending = None
         self.pending_n = 0
         self.last_ball_crop = None
         self.pending_card = None
         self.pending_card_n = 0
+        self.popup = None
         self.last_grid_crop = frame[grid.y0:grid.y1,
                                     grid.x0:grid.x1].copy()
         self._capture_baseline(frame)
@@ -633,12 +1109,22 @@ class App:
         self.status("SCANNING", "new round", "green")
         for row in card:
             print("  " + " ".join(f"{v:>3}" if v is not None else "  -" for v in row))
+        extra_free = sorted(self.free_cells - {(2, 2)})
+        if extra_free:
+            print("extra free/wild: " + ", ".join(f"r{r + 1}c{c + 1}"
+                                                  for r, c in extra_free))
+        if initial_daubs:
+            print("already daubed: " + ", ".join(f"r{r + 1}c{c + 1}"
+                                                  for r, c in sorted(initial_daubs)))
+        if self.initial_uncertain:
+            print("daub state ambiguous - Pick Me Up will ask manually")
         print("constraints: OK")
 
     # ------------------------------------------------------------ loop
 
     def run(self) -> None:
         setup_logging()
+        print(f"bingo helper v{VERSION}")
 
         if self.source_image is None:
             self.mutex = single_instance()
@@ -693,8 +1179,8 @@ class App:
                         self.detect()
                     elif kid == 2:
                         self.overlay_enabled = not self.overlay_enabled
-                        if self.overlay_enabled and self.current_cell:
-                            self.show_cell(*self.current_cell)
+                        if self.overlay_enabled and self.current_cells:
+                            self.show_cells(*self.current_cells)
                         else:
                             self.overlay.hide()
                         print("overlay", "on" if self.overlay_enabled else "off")
@@ -726,8 +1212,9 @@ class App:
                         break
                     frame = self.grab()
                     if frame is not None:
-                        self.poll_ball(frame)
+                        self._confirm_pending(frame)
                         self.check_round(frame)
+                        self.poll_ball(frame)
                 time.sleep(0.03)
         except KeyboardInterrupt:
             pass
