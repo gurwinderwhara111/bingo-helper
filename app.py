@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 logging.disable(logging.INFO)
 
@@ -44,6 +44,7 @@ DAUB_DIFF = 18.0       # stronger diff that confirms a real daub
 DAUB_SAT = 0.40        # daub fill must also cover this much of the cell
 ROUND_CHANGE = 12      # changed cells that mean "card covered or re-dealt"
 ROUND_CHECK = 0.3      # seconds between cheap cell-change checks
+GRID_STABLE_DIFF = 8.0 # saved grid-crop diff below this means "grid has not moved"
 POPUP_RETRY = 0.5      # seconds between failed Pick Me Up title reads
 BALL_SCORE = 0.90      # minimum OCR confidence for a normal ball
 INSTANT_SCORE = 0.92   # minimum OCR confidence for an Instant Ball number
@@ -564,7 +565,7 @@ class App:
             return False
 
         warped = V.rectify(frame, grid)
-        card, scores, free = V.read_card_ex(self.engine, warped)
+        card, scores, free = V.read_card_auto(self.engine, warped)
         issues = V.validate_card(card, free)
         if issues:
             # A wrong card means wrong highlights. Never accept one.
@@ -1010,11 +1011,23 @@ class App:
         if frame is None or self.grid is None or self.card is None:
             return
 
-        # Locate the grid every check. It is cheap, and it stops 1-pixel
-        # capture jitter from looking like a whole new round. Compare the
-        # baseline at the current grid, not the old one.
-        new_grid = V.find_grid(frame)
-        grid = new_grid if new_grid is not None else self.grid
+        # Locate the grid only when the saved grid-crop changed enough.  This
+        # stops the common case from paying full-screen geometry detection on
+        # every cheap round check while still re-anchoring on real moves.
+        grid = self.grid
+        new_grid = None
+        stable = False
+        if self.grid is not None and self.last_grid_crop is not None:
+            crop = frame[self.grid.y0:self.grid.y1,
+                         self.grid.x0:self.grid.x1]
+            if crop.shape == self.last_grid_crop.shape:
+                stable = float(cv2.absdiff(crop, self.last_grid_crop).mean()) < GRID_STABLE_DIFF
+
+        if not stable:
+            new_grid = V.find_grid(frame)
+            if new_grid is not None:
+                grid = new_grid
+
         diffs = self._cell_diffs(frame, grid)
         changed = sum(1 for d in diffs if d > CELL_DIFF)
         moved = (new_grid is not None and self._grid_moved(self.grid, new_grid))
@@ -1061,9 +1074,10 @@ class App:
             return
         self.last_round_ocr = now
 
-        # OCR only when the cells really changed.
+        # OCR only when the cells really changed.  The fast template path is
+        # tried first and falls back to OCR when anything is unreadable.
         warped = V.rectify(frame, grid)
-        card, scores, free = V.read_card_ex(self.engine, warped)
+        card, scores, free = V.read_card_auto(self.engine, warped)
 
         if V.validate_card(card, free):
             # Covered, mid-deal, or unreadable. Keep the saved round and wait.

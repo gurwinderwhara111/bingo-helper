@@ -5,6 +5,8 @@ Everything here is pure computer vision. No capture, no overlay, no game access.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -14,6 +16,9 @@ from typing import Optional
 COL_RANGES = ((1, 15), (16, 30), (31, 45), (46, 60), (61, 75))
 LETTERS = ("B", "I", "N", "G", "O")
 CANON = 500  # rectified grid is CANON x CANON
+BASE_DIR = Path(__file__).resolve().parent
+DIGIT_TEMPLATES_FILE = BASE_DIR / "assets" / "digit_templates.npz"
+FAST_DIGIT_MIN_SCORE = 0.75
 
 
 # ---------------------------------------------------------------- geometry
@@ -303,6 +308,122 @@ def ncc(a, b) -> float:
     b -= b.mean()
     d = np.linalg.norm(a) * np.linalg.norm(b)
     return float((a * b).sum() / d) if d > 1e-6 else 0.0
+
+
+# ---------------------------------------------------------------- fast digits
+
+@lru_cache(maxsize=2)
+def load_digit_templates(path: str = "") -> Optional[tuple[np.ndarray, tuple[str, ...]]]:
+    """Load pre-extracted digit templates for fast card reading.
+
+    The template file is generated from the bundled reference cards, so no OCR
+    is needed at runtime.  A missing or malformed file is not fatal; callers
+    fall back to the OCR path.
+    """
+    file = Path(path) if path else DIGIT_TEMPLATES_FILE
+    try:
+        data = np.load(file, allow_pickle=False)
+        templates = np.asarray(data["templates"], dtype=np.float32)
+        labels = tuple(str(x) for x in data["labels"].tolist())
+    except Exception:
+        return None
+    if templates.ndim != 2 or templates.shape[1] != 1024 or not labels:
+        return None
+    if templates.shape[0] != len(labels):
+        return None
+    return templates, labels
+
+
+def _template_vector(mask) -> np.ndarray:
+    vec = mask.astype(np.float32).ravel()
+    vec -= vec.mean()
+    norm = np.linalg.norm(vec)
+    if norm > 1e-6:
+        vec /= norm
+    return vec
+
+
+def match_digit_mask(mask, templates: tuple[np.ndarray, tuple[str, ...]]) -> tuple[Optional[str], float]:
+    """Return the best digit label and score for one 32x32 digit mask."""
+    mat, labels = templates
+    if mat.size == 0:
+        return None, 0.0
+    scores = mat @ _template_vector(mask)
+    idx = int(scores.argmax())
+    label = labels[idx]
+    return label, float(scores[idx])
+
+
+def read_card_fast(warped, templates=None, size: int = CANON):
+    """Read a 5x5 card using digit templates instead of OCR.
+
+    Returns the same shape as ``read_card_ex``.  Any unreadable or
+    out-of-column number is left as ``None`` so ``validate_card`` can reject
+    it before an overlay is ever shown.
+    """
+    if templates is None:
+        templates = load_digit_templates()
+    if templates is None:
+        return None
+
+    values = [[None] * 5 for _ in range(5)]
+    scores = [[0.0] * 5 for _ in range(5)]
+    free = [[False] * 5 for _ in range(5)]
+    free[2][2] = True  # standard 75-ball FREE space
+
+    for r in range(5):
+        for c in range(5):
+            if r == 2 and c == 2:
+                continue
+            cell = cell_img(warped, r, c, size=size)
+
+            masks = split_digits(cell)
+            if len(masks) not in (1, 2):
+                masks = []
+
+            digits: list[str] = []
+            digit_scores: list[float] = []
+            for mask in masks:
+                digit, score = match_digit_mask(mask, templates)
+                if digit is None or score < FAST_DIGIT_MIN_SCORE:
+                    digits = []
+                    break
+                digits.append(digit)
+                digit_scores.append(score)
+
+            number = 0
+            if digits:
+                number = int("".join(digits))
+                lo, hi = COL_RANGES[c]
+                if not (1 <= number <= 75 and lo <= number <= hi):
+                    number = 0
+
+            if not digits or not number:
+                # Only a cell that cannot be read as a number may be a
+                # pumpkin/free cell.  A just-daubed number cell must stay a
+                # number, or a whole card can look "free".
+                if is_free_cell(cell):
+                    free[r][c] = True
+                    scores[r][c] = 1.0
+                continue
+
+            values[r][c] = number
+            scores[r][c] = min(digit_scores)
+
+    return values, scores, free
+
+
+def read_card_auto(engine, warped, size: int = CANON):
+    """Fast template card read, with an OCR fallback for safety."""
+    fast = read_card_fast(warped, size=size)
+    if fast is not None:
+        values, scores, free = fast
+        issues = validate_card(values, free)
+        good = [scores[r][c] for r in range(5) for c in range(5)
+                if not free[r][c] and values[r][c] is not None]
+        if not issues and good and min(good) >= FAST_DIGIT_MIN_SCORE:
+            return values, scores, free
+    return read_card_ex(engine, warped, size=size)
 
 
 # ---------------------------------------------------------------- OCR

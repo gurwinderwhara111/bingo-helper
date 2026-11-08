@@ -152,6 +152,37 @@ class VisionTests(unittest.TestCase):
                                    min_score=0.92)["number"] for b in balls]
         self.assertEqual(sorted(nums), [57, 59, 63])
 
+    def test_fast_card_read_matches_reference_cards(self):
+        # Normal card: the fast reader must return the same values as OCR.
+        normal = cv2.imread(str(NORMAL))
+        grid = V.find_grid(normal)
+        warped = V.rectify(normal, grid)
+        fast = V.read_card_fast(warped)
+        self.assertIsNotNone(fast)
+        values, scores, free = fast
+        ocr_values, _ocr_scores, ocr_free = V.read_card_ex(self.engine, warped)
+        self.assertEqual(V.validate_card(values, free), [])
+        self.assertEqual(values, ocr_values)
+        self.assertEqual(free, ocr_free)
+        self.assertEqual(values[0][0], 4)
+        self.assertEqual(values[4][4], 67)
+
+        # Instant card has a second visually confirmed free/wild cell.
+        img = cv2.imread(str(INSTANT))
+        xs = [309 + int(i * (634 - 309) / 5) for i in range(6)]
+        ys = [225 + int(i * (536 - 225) / 5) for i in range(6)]
+        grid = V.Grid(309, 225, 634, 536, xs, ys)
+        warped = V.rectify(img, grid)
+        fast = V.read_card_fast(warped)
+        self.assertIsNotNone(fast)
+        values, scores, free = fast
+        ocr_values, _ocr_scores, ocr_free = V.read_card_ex(self.engine, warped)
+        self.assertEqual(V.validate_card(values, free), [])
+        self.assertEqual(free, ocr_free)
+        self.assertEqual([(r, c) for r in range(5) for c in range(5) if free[r][c]],
+                         [(1, 2), (2, 2)])
+        self.assertEqual(values, ocr_values)
+
     def test_pick_me_up_title_and_four_balls(self):
         img = cv2.imread(str(PICK))
         self.assertIsNotNone(img)

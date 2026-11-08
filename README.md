@@ -6,6 +6,24 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.3
+
+v1.3 keeps v1.2 behavior and focuses on speed and system safety:
+
+- **Fast card reading.** Normal cards are read with digit templates instead
+  of running OCR 24 times. On this project's test machine the card read drops
+  from roughly **550–890 ms** to **~5–8 ms**.
+- **OCR fallback stays.** If a template read is unreadable, out of column
+  range, or fails card validation, the helper falls back to RapidOCR rather
+  than guessing. A wrong highlight is still worse than a slower one.
+- **Cached grid geometry.** The saved grid-crop is diffed first, so the helper
+  does not pay full-screen grid detection on every cheap round check. It still
+  re-anchors when the card actually moves, hides, or changes.
+- **Tests added** for the fast card reader against the normal and Instant
+  reference cards.
+- **Template rebuild tool.** `tools/build_digit_templates.py` regenerates
+  `assets/digit_templates.npz` if the game changes its number font.
+
 ## Version 1.2
 
 v1.2 keeps everything in v1.1 and adds recording-based fixes:
@@ -84,6 +102,8 @@ You do **not** need to keep the console open for daily use. The helper logs to
 - **Ball scanning is continuous.** It does not wait for a keypress per call.
 - **The card is locked once per round.** It stores all 25 numbers and their
   screen cells. Calls only move the holes; the card is not re-read every call.
+- **Fast card read first, OCR fallback.** The helper tries the digit templates
+  first; if that read is invalid it falls back to RapidOCR instead of guessing.
 - **Daubs are tracked from card pixels.** A highlight is only a temporary
   marker. The saved daub matrix is what Pick Me Up and bingo counts use.
 - **Popups and powerups keep the saved card.** Free Daub, Pick Me Up, Instant
@@ -208,6 +228,12 @@ This decodes the video locally, runs the same vision/round logic with a virtual
 clock, and writes `debug/replay_<video>/timeline.csv` plus `events.txt`. It
 does not capture your screen, draw an overlay, or click the game.
 
+Rebuild digit templates if the game font changes:
+
+```bat
+python tools/build_digit_templates.py
+```
+
 `run_one.py` is the older one-image debugging tool.
 `power up types with images examples\` contains the high-resolution Instant Ball
 and Pick Me Up reference screenshots used by the tests.
@@ -219,10 +245,10 @@ and Pick Me Up reference screenshots used by the tests.
   `Ctrl+Alt+B` shortcut avoids that; there is no clean way to avoid it otherwise
   without injecting input, which this tool refuses to do.
 - **Pause pauses the helper, not the game.**
-- **v1.2 is offline-validated** against the provided screenshots, unit tests,
+- **v1.3 is offline-validated** against the provided screenshots, unit tests,
   and two gameplay recordings. Do one live round with `start.bat` first. If the
-  game changes skin, powerup artwork, or layout, send a screenshot and it can be
-  tuned.
+  game changes skin, powerup artwork, card font, or layout, rebuild the digit
+  templates or send a screenshot.
 - **Pick Me Up timing is real-time.** The helper reads the popup as fast as it
   can, but it must stay accurate. When in doubt it asks you to choose manually.
 - **75-ball only** (B/I/N/G/O, 1–75). A 90-ball mode would need changes.
@@ -245,6 +271,8 @@ and Pick Me Up reference screenshots used by the tests.
 | `controls.py` | Always-on-top no-focus control bar |
 | `test_v11.py` | Unit tests + Instant/Pick Me Up reference-image checks |
 | `tools/replay_video.py` | Offline replay of a recorded round for validation |
+| `tools/build_digit_templates.py` | Rebuilds the fast digit-template asset |
+| `assets/digit_templates.npz` | Digit templates used by the fast card reader |
 | `run_one.py` | Offline single-screenshot tester |
 | `start_silent.vbs` | No-console launcher (daily use) |
 | `start.bat` | Console launcher (debugging) |
