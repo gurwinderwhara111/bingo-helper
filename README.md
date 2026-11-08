@@ -6,6 +6,20 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.8
+
+v1.8 adds wrong-highlight protection:
+
+- **Half-dealt cards are rejected.** A new-round frame cannot be accepted unless
+  the card has enough readable numbers, so a card being dealt is not mistaken
+  for a card full of free/wild cells.
+- **Unconfirmed highlights clear themselves.** A provisional hole is hidden
+  after a short timeout if it is not confirmed as daubed.
+- **Wrong-cell recovery clears fast.** If you daub a different cell, the old
+  hole is cleared instead of staying on the wrong number.
+- **Safer fast-card threshold.** Low-confidence digit matches now fall back to
+  OCR instead of being accepted as fact.
+
 ## Version 1.7
 
 v1.7 replaces the oversized bar with a professional compact HUD strip:

@@ -95,6 +95,26 @@ class BingoMathTests(unittest.TestCase):
         d = B.initial_daubed()
         self.assertEqual(B.rank_picks(values, d, [13]), [])
 
+    def test_half_dealt_card_is_rejected(self):
+        values = [[None] * 5 for _ in range(5)]
+        free = [[True] * 5 for _ in range(5)]
+        issues = V.validate_card(values, free)
+        self.assertTrue(any("too few readable numbers" in i for i in issues))
+
+    def test_real_free_column_card_is_accepted(self):
+        values = [
+            [1, 16, None, 46, 61],
+            [2, 17, None, 47, 62],
+            [3, 18, None, 48, 63],
+            [4, 19, None, 49, 64],
+            [5, 20, None, 50, 65],
+        ]
+        free = [[False] * 5 for _ in range(5)]
+        free[2][2] = True
+        for r in range(5):
+            free[r][2] = True
+        self.assertEqual(V.validate_card(values, free), [])
+
 
 class VisionTests(unittest.TestCase):
     @classmethod

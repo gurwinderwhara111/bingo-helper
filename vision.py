@@ -18,7 +18,7 @@ LETTERS = ("B", "I", "N", "G", "O")
 CANON = 500  # rectified grid is CANON x CANON
 BASE_DIR = Path(__file__).resolve().parent
 DIGIT_TEMPLATES_FILE = BASE_DIR / "assets" / "digit_templates.npz"
-FAST_DIGIT_MIN_SCORE = 0.75
+FAST_DIGIT_MIN_SCORE = 0.82
 
 
 # ---------------------------------------------------------------- geometry
@@ -953,6 +953,7 @@ def validate_card(values, free=None):
         free = [[False] * 5 for _ in range(5)]
         free[2][2] = True
     issues, seen = [], {}
+    readable = 0
     for r in range(5):
         for c in range(5):
             if free[r][c]:
@@ -961,12 +962,18 @@ def validate_card(values, free=None):
             if v is None:
                 issues.append(f"cell {r},{c}: unreadable")
                 continue
+            readable += 1
             lo, hi = COL_RANGES[c]
             if not (lo <= v <= hi):
                 issues.append(f"cell {r},{c}: {v} outside column {LETTERS[c]} range {lo}-{hi}")
             if v in seen:
                 issues.append(f"duplicate {v} at {seen[v]} and {(r, c)}")
             seen[v] = (r, c)
+    # A real bingo card has almost all cells readable.  A new-round frame can
+    # make the still-hidden cells look like pumpkin/free, so it must be rejected
+    # until the card is dealt.
+    if readable < 18:
+        issues.append(f"too few readable numbers ({readable})")
     return issues
 
 

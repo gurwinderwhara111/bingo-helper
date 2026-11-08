@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.7"
+VERSION = "1.8"
 
 logging.disable(logging.INFO)
 
@@ -44,6 +44,7 @@ DAUB_DIFF = 18.0       # stronger diff that confirms a real daub
 DAUB_SAT = 0.40        # daub fill must also cover this much of the cell
 ROUND_CHANGE = 12      # changed cells that mean "card covered or re-dealt"
 ROUND_CHECK = 0.3      # seconds between cheap cell-change checks
+HIGHLIGHT_TIMEOUT = 3.0 # provisional hole is hidden if not daub-confirmed in time
 GRID_STABLE_DIFF = 8.0 # saved grid-crop diff below this means "grid has not moved"
 POPUP_RETRY = 0.5      # seconds between failed Pick Me Up title reads
 BALL_SCORE = 0.90      # minimum OCR confidence for a normal ball
@@ -208,6 +209,7 @@ class App:
         self.last_instant_check = 0.0
         self.instant_banner = None
         self.instant_active = False
+        self.highlight_deadline = 0.0
         self.initial_uncertain = False
 
     # ------------------------------------------------------------ status
@@ -316,6 +318,7 @@ class App:
         self.last_instant_check = 0.0
         self.instant_banner = None
         self.instant_active = False
+        self.highlight_deadline = 0.0
         self.overlay.hide()
 
     def _set_card_visible(self, visible: bool) -> None:
@@ -410,6 +413,7 @@ class App:
         this is what makes the bingo/Pick Me Up answer correct.
         """
         new = []
+        before_cells = list(self.current_cells)
         for i, d in enumerate(diffs):
             if d < DAUB_DIFF:
                 continue
@@ -434,6 +438,16 @@ class App:
                     self.show_cells(*self.current_cells)
                 else:
                     self.overlay.hide()
+            # If the real daub happened outside the highlighted cell(s), our
+            # provisional hole was wrong.  Never leave a wrong highlight alive.
+            if (before_cells
+                    and all(pos not in before_cells for pos in new)):
+                self.current_cells = []
+                self.pending_cells.clear()
+                self.instant_cells.clear()
+                self.highlight_deadline = 0.0
+                self.overlay.hide()
+                print("provisional highlight cleared - wrong/unconfirmed cell")
         return new
 
     def _cell_diff(self, frame, r: int, c: int, grid=None) -> float:
@@ -794,6 +808,7 @@ class App:
         merged |= {pos for _, _, pos in found}
         self.instant_cells = merged
         self.current_cells = sorted(merged)
+        self.highlight_deadline = time.time() + HIGHLIGHT_TIMEOUT
         summary = " ".join(f"{letter}{num}" for letter, num, _ in found)
         print(f"INSTANT BALL: {summary}")
         suffix = self._bingo_suffix()
@@ -807,6 +822,7 @@ class App:
         ms = (time.perf_counter() - self.pending_t0) * 1000 if self.pending_t0 else 0.0
         self.pending_t0 = 0.0
         self.instant_cells.clear()
+        self.highlight_deadline = 0.0
         pos = V.locate_number(self.card, num)
         self.last_calls.add((letter, num))
         if pos is None:
@@ -830,6 +846,7 @@ class App:
 
         self.current_cells = [pos]
         self.pending_cells[pos] = time.time()
+        self.highlight_deadline = time.time() + HIGHLIGHT_TIMEOUT
         print(f"{letter} {num} -> row {r + 1} col {c + 1}  ({ms:.0f} ms)")
         suffix = self._bingo_suffix()
         self.status("SCANNING" if self.card_visible else "CARD HIDDEN",
@@ -1027,6 +1044,19 @@ class App:
         self.last_round_check = now
 
         if frame is None or self.grid is None or self.card is None:
+            return
+
+        # A provisional highlight must never survive forever.  If the user
+        # daubs a different cell, the daub logic clears it immediately; this
+        # catches a wrong hole that is simply never confirmed.
+        if (self.current_cells and self.card_visible
+                and now > self.highlight_deadline):
+            self.current_cells = []
+            self.pending_cells.clear()
+            self.instant_cells.clear()
+            self.highlight_deadline = 0.0
+            self.overlay.hide()
+            print("provisional highlight cleared - unconfirmed timeout")
             return
 
         # Locate the grid only when the saved grid-crop changed enough.  This
