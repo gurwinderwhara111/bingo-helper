@@ -6,6 +6,14 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.6
+
+v1.6 improves the on-screen control bar:
+
+- **Larger, more readable bar.** Bigger status text, larger buttons, full
+  `Scan` / `Pause` / `Quit` labels, and a wider status area.
+- **Same no-focus behavior.** It still never steals focus from the game.
+
 ## Version 1.5
 
 v1.5 fixes Pick Me Up tie behavior:
@@ -181,7 +189,7 @@ The helper does **not** activate the powerup and does **not** pick for you.
 
 ## The control bar
 
-A small bar sits above the taskbar (drag it anywhere):
+A larger, always-on-top control bar sits above the taskbar (drag it anywhere):
 
 | Button | Action |
 |--------|--------|

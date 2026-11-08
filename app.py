@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.5"
+VERSION = "1.6"
 
 logging.disable(logging.INFO)
 
