@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 logging.disable(logging.INFO)
 
@@ -977,21 +977,26 @@ class App:
                 print(f"PICK ME UP: unconfirmed daub changes best "
                       f"({top} vs {alt_top})")
 
-        top_score = choices[0].score
-        ties = [p for p in choices if p.score == top_score]
-        if len(ties) > 1:
-            names = "/".join(str(p.number) for p in ties)
-            self.popup = {"offers": tuple(offers), "best": None, "manual": True,
-                          "reason": "tie", "choices": choices, "t": now,
-                          "title": title}
-            self.status("PICK ME UP", f"tie {names} - choose manually", "amber")
-            print("PICK ME UP: tie -> manual")
-            return True
         if uncertain:
             self.popup = {"offers": tuple(offers), "best": None, "manual": True,
                           "reason": "unconfirmed daub",
                           "choices": choices, "t": now, "title": title}
             self.status("PICK ME UP", "last call unconfirmed - manual", "amber")
+            return True
+
+        top_score = choices[0].score
+        ties = [p for p in choices if p.score == top_score]
+        if len(ties) > 1:
+            # An exact tie means every tied pick is equally valid. Pick the
+            # top one and still show all tied numbers, instead of refusing.
+            names = "/".join(str(p.number) for p in ties)
+            best = ties[0]
+            self.popup = {"offers": tuple(offers), "best": best.number,
+                          "manual": False, "reason": "tie",
+                          "choices": choices, "t": now, "title": title}
+            self.status("PICK ME UP", B.format_tie_choice(ties), "amber")
+            print(f"PICK ME UP tie {names}=> PICK {best.number} at "
+                  f"r{best.row + 1}c{best.col + 1}")
             return True
 
         best = choices[0]

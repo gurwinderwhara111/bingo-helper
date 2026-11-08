@@ -6,6 +6,17 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.5
+
+v1.5 fixes Pick Me Up tie behavior:
+
+- **Exact ties now produce a pick instead of "manual".** If two or more offers
+  score exactly the same, the helper picks the top tied number and still shows
+  the tied numbers, e.g. `tie 44/37 -> PICK 44`.
+- **Safety unchanged for real uncertainty.** Manual is still used when fewer
+  than four balls are readable, no offer is on the card, or the last daub is
+  unconfirmed.
+
 ## Version 1.4
 
 v1.4 fixes Instant Ball detection from the real power-up screenshot:
@@ -158,10 +169,13 @@ You still click/daub the cells.
 It shows `choose manually` when:
 
 - fewer than four balls could be read,
-- two choices score exactly the same,
+- none of the offers are on the card or its cell is already daubed,
 - a just-called cell has not been visually confirmed as daubed and would change
   the answer,
 - the daub state could not be read clearly.
+
+An exact tie is no longer a failure. The helper picks the top tied number and
+shows the tied alternatives, for example `tie 44/37 -> PICK 44`.
 
 The helper does **not** activate the powerup and does **not** pick for you.
 

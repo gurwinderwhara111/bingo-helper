@@ -87,6 +87,8 @@ class BingoMathTests(unittest.TestCase):
         choices = B.rank_picks(values, d, [1, 21])
         self.assertEqual(len(choices), 2)
         self.assertEqual(choices[0].score, choices[1].score)
+        self.assertEqual(B.format_tie_choice(choices),
+                         "tie 21/1 -> PICK 21")
 
     def test_centre_pick_is_skipped(self):
         values = values_1_to_25()

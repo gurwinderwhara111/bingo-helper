@@ -125,6 +125,16 @@ def format_choice(choice: PickChoice) -> str:
     return f"PICK {choice.number} -> setup"
 
 
+def format_tie_choice(choices: Sequence[PickChoice]) -> str:
+    """Short line for the control bar when several offers score the same.
+
+    The top tie is still a valid pick because every tied choice scores
+    equally, but the user can see the alternatives.
+    """
+    names = "/".join(str(p.number) for p in choices)
+    return f"tie {names} -> PICK {choices[0].number}"
+
+
 def format_ranking(choices: Sequence[PickChoice]) -> list[str]:
     """Full ranking for the log, one line per choice."""
     lines = []
