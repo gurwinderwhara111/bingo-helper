@@ -183,6 +183,19 @@ class VisionTests(unittest.TestCase):
                          [(1, 2), (2, 2)])
         self.assertEqual(values, ocr_values)
 
+    def test_instant_ball_layout_detected(self):
+        # The real power-up screenshot itself must be recognized.
+        img = cv2.imread(str(INSTANT))
+        xs = [309 + int(i * (634 - 309) / 5) for i in range(6)]
+        ys = [225 + int(i * (536 - 225) / 5) for i in range(6)]
+        grid = V.Grid(309, 225, 634, 536, xs, ys)
+        self.assertTrue(V.detect_instant_ball(img, grid))
+
+        # A called-ball history row must not be recognized as Instant Ball.
+        normal = cv2.imread(str(NORMAL))
+        grid = V.find_grid(normal)
+        self.assertFalse(V.detect_instant_ball(normal, grid))
+
     def test_pick_me_up_title_and_four_balls(self):
         img = cv2.imread(str(PICK))
         self.assertIsNotNone(img)

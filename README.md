@@ -6,6 +6,20 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.4
+
+v1.4 fixes Instant Ball detection from the real power-up screenshot:
+
+- **Instant Ball now works without relying on the pink text pill.** The real
+  power-up can show three large balls directly above the card with no readable
+  "INSTANT BALL" banner. The helper now recognizes three large balls aligned in
+  one row above the grid.
+- **No fake Instant Ball from normal history.** A single current ball or small
+  call-history balls do not trigger this path.
+- **Reference-image test added** for the actual Instant Ball layout.
+- **Real app image test passes:** `G57 O63 G59` are read and all matching
+  cells open together.
+
 ## Version 1.3
 
 v1.3 keeps v1.2 behavior and focuses on speed and system safety:

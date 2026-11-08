@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 logging.disable(logging.INFO)
 
@@ -207,6 +207,7 @@ class App:
         self.last_popup_text = ""
         self.last_instant_check = 0.0
         self.instant_banner = None
+        self.instant_active = False
         self.initial_uncertain = False
 
     # ------------------------------------------------------------ status
@@ -314,6 +315,7 @@ class App:
         self.initial_uncertain = False
         self.last_instant_check = 0.0
         self.instant_banner = None
+        self.instant_active = False
         self.overlay.hide()
 
     def _set_card_visible(self, visible: bool) -> None:
@@ -672,14 +674,25 @@ class App:
         self.pending_n = 0
         self.commit(letter, num)
 
-    def _instant_ball_active(self, frame) -> bool:
-        """True only while the game's own INSTANT BALL banner is on screen."""
+    def _instant_ball_active(self, frame, bboxes=None) -> bool:
+        """True only while a real Instant Ball is on screen.
+
+        Two independent confirmations prevent the small called-ball history row
+        from becoming fake Instant Ball guidance: the game's own banner when it
+        is present, or three large balls aligned in one row as in the official
+        power-up screenshot.
+        """
         now = time.time()
         if now - self.last_instant_check < 0.25:
-            return self.instant_banner is not None
+            return self.instant_active
         self.last_instant_check = now
-        self.instant_banner = V.find_instant_ball_banner(frame, self.grid)
-        return self.instant_banner is not None
+        self.instant_active = False
+        if bboxes and V.detect_instant_ball(frame, self.grid, bboxes):
+            self.instant_active = True
+        else:
+            self.instant_banner = V.find_instant_ball_banner(frame, self.grid)
+            self.instant_active = self.instant_banner is not None
+        return self.instant_active
 
     def poll_ball(self, frame) -> None:
         if not self.card_visible or self.popup is not None:
@@ -724,7 +737,7 @@ class App:
             self.last_popup_check = 0.0
             if self._check_pick_me_up(frame):
                 return
-            if self._instant_ball_active(frame):
+            if self._instant_ball_active(frame, bboxes):
                 self._poll_instant(frame, bboxes)
                 return
             # Current ball sits to the right of the call history.

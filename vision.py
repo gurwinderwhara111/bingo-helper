@@ -776,6 +776,38 @@ def find_pink_band(img):
     return best[1:] if best else None
 
 
+def detect_instant_ball(img, grid: Grid, bboxes=None) -> bool:
+    """True when the game is showing three real Instant Balls.
+
+    Normal play also shows small call-history balls above the card, and a
+    single current ball.  The game's Instant Ball text/pill is not always
+    visible in every capture, so this geometry check requires three large
+    balls in the same row, which the normal history row does not look like.
+    """
+    if grid is None:
+        return False
+    if bboxes is None:
+        bboxes = find_balls(img, grid, max_balls=3)
+    if len(bboxes) < 3:
+        return False
+
+    cell = grid.width / 5.0
+    large = []
+    for x, y, w, h in bboxes:
+        if w >= 0.78 * cell and h >= 0.78 * cell:
+            large.append((x, y, w, h))
+    if len(large) < 3:
+        return False
+
+    centres = [y + h / 2 for _x, y, _w, h in large]
+    if max(centres) - min(centres) > 0.35 * cell:
+        return False
+
+    # They must sit above the playing grid, like the power-up screenshot.
+    top = min(y for _x, y, _w, _h in large)
+    return top < grid.y0
+
+
 def find_popup_title(engine, img):
     """Return (title_bbox, text) when the screen is the Pick Me Up popup."""
     band = find_pink_band(img)
