@@ -6,17 +6,36 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
-## Version 1.1
+## Version 1.2
 
-New in v1.1:
+v1.2 keeps everything in v1.1 and adds recording-based fixes:
+
+- **Instant Ball is confirmed by the game's own banner.** Normal play shows a
+  row of small call-history balls above the card. Multiple ball boxes alone no
+  longer become Instant Ball. The helper only opens every large ball when the
+  pink **INSTANT BALL** marker is present; otherwise it treats the largest/
+  right-most ball as one normal call.
+- **Offline gameplay replay validation.** `tools/replay_video.py` runs the real
+  helper logic over a recorded round with no screen capture, overlay, or input.
+  It prints a CSV timeline and event log so mistakes can be reviewed safely.
+- **More robust grid detection from real recordings.** Internal row/column
+  lines can be hidden by daubs; the grid now infers the missing spacing from
+  the card edges instead of giving up, while still rejecting non-square panels.
+- **Multiple free/wild cells are supported**, including a whole pumpkin/free
+  column when the game deals one. Extra free cells are read visually, not from
+  a failed OCR read.
+
+### Version 1.1
+
+v1.1 added:
 
 - **Daub tracking.** The helper remembers which cells are already daubed and
   never tells you to pick a number that is already covered.
 - **Bingo line engine.** Rows, columns, both diagonals, and the four corners
   (13 lines total, matching the game's help screen).
-- **Instant Ball.** When 2-3 large balls appear together, it reads all of them
-  and opens all matching cells at once. No second confirming read, because
-  those balls disappear quickly.
+- **Instant Ball.** When 2-3 large balls appear together with the game's
+  Instant Ball marker, it reads all of them and opens all matching cells at
+  once. No second confirming read, because those balls disappear quickly.
 - **Pick Me Up.** Reads the four offered balls, simulates each one against every
   bingo line, and shows the best choice in the status bar. Ties, unreadable
   balls, or an uncertain daub state show **choose manually** instead of guessing.
@@ -26,9 +45,10 @@ New in v1.1:
   helper starts. If the colour is ambiguous, Pick Me Up asks you to choose
   manually for that round.
 
-v1.0 was manually validated in the live game. v1.1 is validated offline against
-the reference screenshots and unit tests; run one live round with the console
-open (`start.bat`) before relying on Pick Me Up timing.
+v1.1 was manually validated in the live game. v1.2 is validated offline against
+the reference screenshots, unit tests, and two gameplay recordings. Still do
+one live round with the console open (`start.bat`) before relying on Pick Me Up
+timing.
 
 ---
 
@@ -92,9 +112,12 @@ You do **not** need to keep the console open for daily use. The helper logs to
 
 ## Powerups
 
-**Instant Ball** — the helper reads every large ball it can see and opens all
-matching cells together. If one ball is unreadable it still opens the rest; a
-missed ball is better than a wrong one. You still click/daub the cells.
+**Instant Ball** — the helper reads every large ball it can see **only while
+the game's pink INSTANT BALL marker is present** and opens all matching cells
+together. Normal call-history balls are not Instant Ball. If the marker is
+missing, multiple ball boxes are treated as one normal call. If one ball is
+unreadable it still opens the rest; a missed ball is better than a wrong one.
+You still click/daub the cells.
 
 **Pick Me Up** — the status bar shows the best offered number, for example
 `PICK ME UP | PICK 44 -> 1 BINGO`. The full ranking is printed to the log.
@@ -175,6 +198,16 @@ Single-screenshot tester (normal card):
 python app.py --image "Screenshot 2026-11-06 095328.png" --dry-run --polls 2
 ```
 
+Offline gameplay replay (real recorded round, local only):
+
+```bat
+python tools/replay_video.py "path\to\gameplay.mp4" --fps 4 --start 8 --end 150
+```
+
+This decodes the video locally, runs the same vision/round logic with a virtual
+clock, and writes `debug/replay_<video>/timeline.csv` plus `events.txt`. It
+does not capture your screen, draw an overlay, or click the game.
+
 `run_one.py` is the older one-image debugging tool.
 `power up types with images examples\` contains the high-resolution Instant Ball
 and Pick Me Up reference screenshots used by the tests.
@@ -186,9 +219,10 @@ and Pick Me Up reference screenshots used by the tests.
   `Ctrl+Alt+B` shortcut avoids that; there is no clean way to avoid it otherwise
   without injecting input, which this tool refuses to do.
 - **Pause pauses the helper, not the game.**
-- **v1.1 is offline-validated** against the provided screenshots and tests. Do
-  one live round with `start.bat` first. If the game changes skin, powerup
-  artwork, or layout, send a screenshot and it can be tuned.
+- **v1.2 is offline-validated** against the provided screenshots, unit tests,
+  and two gameplay recordings. Do one live round with `start.bat` first. If the
+  game changes skin, powerup artwork, or layout, send a screenshot and it can be
+  tuned.
 - **Pick Me Up timing is real-time.** The helper reads the popup as fast as it
   can, but it must stay accurate. When in doubt it asks you to choose manually.
 - **75-ball only** (B/I/N/G/O, 1–75). A 90-ball mode would need changes.
@@ -210,6 +244,7 @@ and Pick Me Up reference screenshots used by the tests.
 | `overlay.py` | Topmost click-through per-pixel-alpha window (one or many holes) |
 | `controls.py` | Always-on-top no-focus control bar |
 | `test_v11.py` | Unit tests + Instant/Pick Me Up reference-image checks |
+| `tools/replay_video.py` | Offline replay of a recorded round for validation |
 | `run_one.py` | Offline single-screenshot tester |
 | `start_silent.vbs` | No-console launcher (daily use) |
 | `start.bat` | Console launcher (debugging) |

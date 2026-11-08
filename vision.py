@@ -107,6 +107,11 @@ def find_header(img):
     return best[1], best[2], best[3], best[4]
 
 
+def _even_span(a: int, b: int, n: int = 6) -> list[int]:
+    """Six evenly spaced coordinates from a to b, inclusive."""
+    return [int(round(a + (b - a) * i / (n - 1))) for i in range(n)]
+
+
 def find_grid(img) -> Optional[Grid]:
     header = find_header(img)
     if header is None:
@@ -129,20 +134,68 @@ def find_grid(img) -> Optional[Grid]:
     hp = [p for p in _collapse(rows) if p > hy1 + 10]
 
     ys = _pick_even([hy1] + hp, 6) or _pick_even(hp, 6)
-    if ys is None:
-        return None
 
-    # --- vertical boundaries
-    gy0, gy1 = ys[0], ys[-1]
-    gh = max(1, gy1 - gy0)
-    kv = max(40, int(0.14 * gh))
+    # --- vertical boundaries. When several cells are daubed, grid lines can
+    # be covered and neither set of internal lines is complete. Search a
+    # slightly larger window, then infer the missing spacing from the outer
+    # edges instead of giving up on the whole card.
+    if ys is not None:
+        gy0, gy1 = ys[0], ys[-1]
+        gh = max(1, gy1 - gy0)
+        kv = max(40, int(0.14 * gh))
+        col_frac = 0.45
+    else:
+        gy0 = hy1
+        gy1 = min(H, hy1 + int(1.25 * hw))
+        gh = max(1, gy1 - gy0)
+        kv = max(20, int(0.10 * gh))
+        col_frac = 0.40
+
     vm = cv2.morphologyEx(bw, cv2.MORPH_OPEN,
                           cv2.getStructuringElement(cv2.MORPH_RECT, (1, kv)))
     x_lo, x_hi = max(0, hx0 - 20), min(W, hx1 + 20)
     cols = [x for x in range(x_lo, x_hi)
-            if int((vm[gy0:gy1, x] > 0).sum()) > 0.45 * gh]
-    xs = _pick_even(_collapse(cols), 6)
+            if int((vm[gy0:gy1, x] > 0).sum()) > col_frac * gh]
+    cols = _collapse(cols)
+    xs = _pick_even(cols, 6)
+
     if xs is None:
+        # Keep only candidates near the header ends, then infer five equal
+        # columns between them. Internal line detection may have missed a few.
+        margin = max(20, int(0.12 * hw))
+        lefts = [x for x in cols if abs(x - hx0) <= margin]
+        rights = [x for x in cols if abs(x - hx1) <= margin]
+        left = min(lefts, key=lambda x: abs(x - hx0)) if lefts else hx0
+        right = max(rights, key=lambda x: abs(x - hx1)) if rights else hx1
+        if right - left >= 0.6 * hw:
+            xs = _even_span(left, right)
+        else:
+            xs = _even_span(hx0, hx1)
+
+    if ys is None:
+        # The card is five equal rows. Use the width as the scale and prefer
+        # a real bottom border when one survived the daubs.
+        expected_h = int(round(0.94 * (xs[-1] - xs[0])))
+        bottom = None
+        for p in hp:
+            if abs((p - hy1) - expected_h) <= max(12, int(0.10 * expected_h)):
+                bottom = p
+                break
+        if bottom is None:
+            bottom = min(H - 1, hy1 + expected_h)
+        if bottom <= hy1 + 10:
+            return None
+        ys = _even_span(hy1, bottom)
+
+    if (xs[0] < 0 or ys[0] < 0 or xs[-1] >= W or ys[-1] >= H
+            or xs[-1] - xs[0] < 100 or ys[-1] - ys[0] < 100):
+        return None
+
+    # A bingo card's 5x5 grid is essentially square. Reject a loose
+    # header-like strip or a partial bottom UI panel before it can be treated
+    # as a card.
+    ratio = (ys[-1] - ys[0]) / max(1, xs[-1] - xs[0])
+    if not 0.75 <= ratio <= 1.15:
         return None
 
     return Grid(x0=xs[0], y0=ys[0], x1=xs[5], y1=ys[5], xs=xs, ys=ys)
@@ -619,6 +672,68 @@ def find_popup_title(engine, img):
     if "PICKMEUP" in norm or ("PICK" in norm and "UP" in norm):
         return band, txt.strip()
     return None
+
+
+def find_instant_ball_banner(img, grid: Grid):
+    """Detect the pink INSTANT BALL pill under the card.
+
+    Normal play also shows small call-history balls above the card, so multiple
+    ball boxes alone must never become Instant Ball guidance.  The pill is a
+    small, wide, centred marker directly below the card.  The normal BINGO
+    button is farther sideways and not pill-shaped, so it does not match.
+    """
+    if grid is None:
+        return None
+    H, W = img.shape[:2]
+    x0 = max(0, grid.x0 - int(0.25 * grid.width))
+    x1 = min(W, grid.x1 + int(0.25 * grid.width))
+    y0 = max(0, grid.y1 - int(0.10 * grid.height))
+    y1 = min(H, grid.y1 + int(0.35 * grid.height))
+    if x1 - x0 < 40 or y1 - y0 < 20:
+        return None
+
+    roi = img[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    # Coral/pink/red sits at the red end of the hue wheel in OpenCV (0-179).
+    mask = ((((hue >= 130) | (hue <= 12)) & (sat >= 70) & (val >= 100))
+            * 255).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    n, _, st, _ = cv2.connectedComponentsWithStats(mask, 8)
+    card_bottom = grid.y1
+    card_cx = (grid.x0 + grid.x1) / 2
+    best = None
+    for i in range(1, n):
+        bx, by, bw, bh, area = st[i]
+        bw, bh = int(bw), int(bh)
+        if bw < 0.35 * grid.width or bw > 0.95 * grid.width:
+            continue
+        if bh < 0.22 * grid.height or bh > 0.35 * grid.height:
+            continue
+        aspect = bw / max(bh, 1)
+        if aspect < 1.3 or aspect > 3.8:
+            continue
+        if area < 0.035 * grid.width * grid.height:
+            continue
+        ax, ay = int(bx + x0), int(by + y0)
+        cx, cy = ax + bw / 2, ay + bh / 2
+        # The real banner is a speech bubble attached to the power-up button,
+        # so its top sits at the card's bottom edge.  The permanent power-up
+        # tray below the card starts lower and is not a call.
+        if ay < card_bottom - 0.12 * grid.height:
+            continue
+        if ay > card_bottom + 0.06 * grid.height:
+            continue
+        if cy > card_bottom + 0.30 * grid.height:
+            continue
+        if abs(cx - card_cx) > 0.40 * grid.width:
+            continue
+        score = (area, -abs(cy - card_bottom))
+        if best is None or score > best[0]:
+            best = (score, (ax, ay, bw, bh))
+
+    return best[1] if best else None
 
 
 def find_popup_balls(img, region, max_balls: int = 4):

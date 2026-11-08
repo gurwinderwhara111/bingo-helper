@@ -19,3 +19,7 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+
+# Gameplay recordings
+gameplay videos/
+

@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 logging.disable(logging.INFO)
 
@@ -204,6 +204,8 @@ class App:
         self.popup = None             # cached Pick Me Up result
         self.last_popup_check = 0.0
         self.last_popup_text = ""
+        self.last_instant_check = 0.0
+        self.instant_banner = None
         self.initial_uncertain = False
 
     # ------------------------------------------------------------ status
@@ -309,6 +311,8 @@ class App:
         self.last_round_ocr = 0.0
         self.popup = None
         self.initial_uncertain = False
+        self.last_instant_check = 0.0
+        self.instant_banner = None
         self.overlay.hide()
 
     def _set_card_visible(self, visible: bool) -> None:
@@ -633,6 +637,49 @@ class App:
         return V.Grid(x0=g.x0 - dx, y0=g.y0 - dy, x1=g.x1 - dx, y1=g.y1 - dy,
                       xs=[x - dx for x in g.xs], ys=[y - dy for y in g.ys])
 
+    def _handle_ball(self, frame, bbox) -> None:
+        """Read and confirm one normal called ball."""
+        ball = V.read_ball(self.engine, frame, bbox)
+        num = ball["number"]
+        if num is None or not (1 <= num <= 75) or ball["number_score"] < BALL_SCORE:
+            self.last_ball_crop = None  # retry the read, keep any pending call
+            return
+        letter = ball["letter"]
+        derived = V.letter_for(num)
+        if letter and derived != letter:
+            print(f"reject: ball says {letter} {num}, range says {derived}")
+            self.last_ball_crop = None
+            return
+        if not letter:
+            letter = derived or "?"
+
+        key = (letter, num)
+        if key in self.last_calls:
+            self.pending = None
+            self.pending_n = 0
+            return
+        if key == self.pending:
+            self.pending_n += 1
+        else:
+            self.pending = key
+            self.pending_n = 1
+            self.pending_t0 = time.perf_counter()
+        if self.pending_n < 2:
+            return
+
+        self.last_calls.add(key)
+        self.pending_n = 0
+        self.commit(letter, num)
+
+    def _instant_ball_active(self, frame) -> bool:
+        """True only while the game's own INSTANT BALL banner is on screen."""
+        now = time.time()
+        if now - self.last_instant_check < 0.25:
+            return self.instant_banner is not None
+        self.last_instant_check = now
+        self.instant_banner = V.find_instant_ball_banner(frame, self.grid)
+        return self.instant_banner is not None
+
     def poll_ball(self, frame) -> None:
         if not self.card_visible or self.popup is not None:
             return
@@ -669,46 +716,23 @@ class App:
         # the user wait for a second confirming read; these balls disappear.
         # Before treating a multi-ball frame as Instant Ball, rule out Pick Me
         # Up: its four offered balls can otherwise look like free balls and
-        # produce a wrong highlight.
+        # produce a wrong highlight.  History balls above the card can also
+        # produce several boxes; only the game's INSTANT BALL banner makes
+        # those balls count, otherwise treat it as one current ball.
         if len(bboxes) >= 2:
             self.last_popup_check = 0.0
             if self._check_pick_me_up(frame):
                 return
-            self._poll_instant(frame, bboxes)
+            if self._instant_ball_active(frame):
+                self._poll_instant(frame, bboxes)
+                return
+            # Current ball sits to the right of the call history.
+            bbox = max(bboxes, key=lambda b: b[0])
+            self._handle_ball(frame, bbox)
             return
 
         bbox = bboxes[0]
-        ball = V.read_ball(self.engine, frame, bbox)
-        num = ball["number"]
-        if num is None or not (1 <= num <= 75) or ball["number_score"] < BALL_SCORE:
-            self.last_ball_crop = None  # retry the read, keep any pending call
-            return
-        letter = ball["letter"]
-        derived = V.letter_for(num)
-        if letter and derived != letter:
-            print(f"reject: ball says {letter} {num}, range says {derived}")
-            self.last_ball_crop = None
-            return
-        if not letter:
-            letter = derived or "?"
-
-        key = (letter, num)
-        if key in self.last_calls:
-            self.pending = None
-            self.pending_n = 0
-            return
-        if key == self.pending:
-            self.pending_n += 1
-        else:
-            self.pending = key
-            self.pending_n = 1
-            self.pending_t0 = time.perf_counter()
-        if self.pending_n < 2:
-            return
-
-        self.last_calls.add(key)
-        self.pending_n = 0
-        self.commit(letter, num)
+        self._handle_ball(frame, bbox)
 
     def _poll_instant(self, frame, bboxes) -> None:
         """Read all large balls and show all matching holes together."""
