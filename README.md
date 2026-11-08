@@ -6,6 +6,19 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.9
+
+v1.9 changes normal call handling to prioritize **zero missed guidance**:
+
+- **One reliable read commits immediately.** A high-confidence called ball is
+  no longer made to wait for a second polling confirmation.
+- **Low-confidence reads retry.** The helper still never invents a number; it
+  keeps trying until the ball can be read.
+- **No stale auto-hide.** A valid highlight is not removed merely because the
+  daub pixel confirmation is slow.
+- **Wrong-cell recovery remains.** If a different cell is actually daubed, the
+  wrong hole is cleared immediately.
+
 ## Version 1.8
 
 v1.8 adds wrong-highlight protection:
@@ -194,7 +207,8 @@ You do **not** need to keep the console open for daily use. The helper logs to
 the game's pink INSTANT BALL marker is present** and opens all matching cells
 together. Normal call-history balls are not Instant Ball. If the marker is
 missing, multiple ball boxes are treated as one normal call. If one ball is
-unreadable it still opens the rest; a missed ball is better than a wrong one.
+unreadable it still opens the readable balls and keeps retrying the shot; the
+goal is no missed ball, not silently skipping one.
 You still click/daub the cells.
 
 **Pick Me Up** — the status bar shows the best offered number, for example

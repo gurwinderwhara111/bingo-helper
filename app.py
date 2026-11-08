@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.8"
+VERSION = "1.9"
 
 logging.disable(logging.INFO)
 
@@ -44,10 +44,10 @@ DAUB_DIFF = 18.0       # stronger diff that confirms a real daub
 DAUB_SAT = 0.40        # daub fill must also cover this much of the cell
 ROUND_CHANGE = 12      # changed cells that mean "card covered or re-dealt"
 ROUND_CHECK = 0.3      # seconds between cheap cell-change checks
-HIGHLIGHT_TIMEOUT = 3.0 # provisional hole is hidden if not daub-confirmed in time
+HIGHLIGHT_TIMEOUT = 0.0 # 0 disables stale auto-hide: never remove valid guidance
 GRID_STABLE_DIFF = 8.0 # saved grid-crop diff below this means "grid has not moved"
 POPUP_RETRY = 0.5      # seconds between failed Pick Me Up title reads
-BALL_SCORE = 0.90      # minimum OCR confidence for a normal ball
+BALL_SCORE = 0.92      # minimum OCR confidence for a normal ball
 INSTANT_SCORE = 0.92   # minimum OCR confidence for an Instant Ball number
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -655,35 +655,33 @@ class App:
                       xs=[x - dx for x in g.xs], ys=[y - dy for y in g.ys])
 
     def _handle_ball(self, frame, bbox) -> None:
-        """Read and confirm one normal called ball."""
-        ball = V.read_ball(self.engine, frame, bbox)
+        """Read and confirm one normal called ball.
+
+        This path is intentionally biased toward coverage: if the ball can be
+        read reliably once, do not wait for a second poll and risk missing the
+        next call.  Low-confidence reads are still retried instead of guessed.
+        """
+        ball = V.read_ball_robust(self.engine, frame, bbox,
+                                  min_score=BALL_SCORE)
         num = ball["number"]
         if num is None or not (1 <= num <= 75) or ball["number_score"] < BALL_SCORE:
             self.last_ball_crop = None  # retry the read, keep any pending call
             return
-        letter = ball["letter"]
+
         derived = V.letter_for(num)
-        if letter and derived != letter:
-            print(f"reject: ball says {letter} {num}, range says {derived}")
+        if derived is None:
             self.last_ball_crop = None
             return
-        if not letter:
-            letter = derived or "?"
-
+        letter = derived
         key = (letter, num)
         if key in self.last_calls:
             self.pending = None
             self.pending_n = 0
             return
-        if key == self.pending:
-            self.pending_n += 1
-        else:
-            self.pending = key
-            self.pending_n = 1
-            self.pending_t0 = time.perf_counter()
-        if self.pending_n < 2:
-            return
 
+        self.pending = key
+        self.pending_n = 1
+        self.pending_t0 = time.perf_counter()
         self.last_calls.add(key)
         self.pending_n = 0
         self.commit(letter, num)
@@ -1049,7 +1047,7 @@ class App:
         # A provisional highlight must never survive forever.  If the user
         # daubs a different cell, the daub logic clears it immediately; this
         # catches a wrong hole that is simply never confirmed.
-        if (self.current_cells and self.card_visible
+        if (HIGHLIGHT_TIMEOUT > 0 and self.current_cells and self.card_visible
                 and now > self.highlight_deadline):
             self.current_cells = []
             self.pending_cells.clear()
