@@ -238,6 +238,15 @@ class VisionTests(unittest.TestCase):
         self.assertIsNone(values[0][0])
         self.assertFalse(free[0][0])
 
+    def test_daubed_unknown_cell_is_not_free(self):
+        # A daubed cell with no locked value is unknown: it must stay
+        # unreadable and must never be labelled a free/wild cell.
+        warped = np.full((500, 500, 3), 255, np.uint8)
+        warped[8:92, 8:92] = (109, 156, 237)  # BGR of #ED9C7D orange daub
+        values, scores, free = V.read_card_fast(warped, daubed={(0, 0)})
+        self.assertIsNone(values[0][0])
+        self.assertFalse(free[0][0])
+
     def test_instant_ball_layout_detected(self):
         # The real power-up screenshot itself must be recognized.
         img = cv2.imread(str(INSTANT))

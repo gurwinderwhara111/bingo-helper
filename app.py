@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.10"
+VERSION = "1.11"
 
 logging.disable(logging.INFO)
 
@@ -48,6 +48,8 @@ HIGHLIGHT_TIMEOUT = 0.0 # 0 disables stale auto-hide: never remove valid guidanc
 GRID_STABLE_DIFF = 8.0 # saved grid-crop diff below this means "grid has not moved"
 POPUP_RETRY = 0.5      # seconds between failed Pick Me Up title reads
 PICK_RETRY = 0.25      # seconds between Pick Me Up reads while balls pop in
+ROUND_READABLE = 23    # cells a switch candidate must read before it is trusted
+MIN_CARD_WIDTH = 300   # px - below this, small cells make OCR errors multiply
 BALL_SCORE = 0.92      # minimum OCR confidence for a normal ball
 INSTANT_SCORE = 0.92   # minimum OCR confidence for an Instant Ball number
 
@@ -207,6 +209,9 @@ class App:
         self.popup = None             # cached Pick Me Up result
         self.last_popup_check = 0.0
         self.popup_wait_until = 0.0   # holding state while offers pop in
+        self.lock_candidate = None    # two agreeing reads lock a fresh scan
+        self.lock_candidate_n = 0
+        self.last_verify = 0.0        # last miss-driven card re-read
         self.last_popup_text = ""
         self.last_instant_check = 0.0
         self.instant_banner = None
@@ -316,6 +321,8 @@ class App:
         self.last_round_check = 0.0
         self.last_round_ocr = 0.0
         self.popup = None
+        self.lock_candidate = None
+        self.lock_candidate_n = 0
         self.initial_uncertain = False
         self.last_instant_check = 0.0
         self.instant_banner = None
@@ -582,6 +589,11 @@ class App:
                     self.status("WAITING FOR CARD", "keep the game visible", "amber")
             return False
 
+        if grid.width < MIN_CARD_WIDTH:
+            print(f"grid only {grid.width}px wide - maximize the window "
+                  "for reliable reads")
+            self.status("CARD FOUND", "card small - maximize window", "amber")
+
         warped = V.rectify(frame, grid)
         card, scores, free = V.read_card_auto(self.engine, warped)
         issues = V.validate_card(card, free)
@@ -599,6 +611,21 @@ class App:
                 if not quiet:
                     self.status("CARD UNREADABLE", "retrying...", "red")
             return False
+
+        # Two agreeing reads lock a fresh scan. One deal-animation frame
+        # must never become the round.
+        if card != self.lock_candidate:
+            self.lock_candidate = card
+            self.lock_candidate_n = 1
+        else:
+            self.lock_candidate_n += 1
+        if self.lock_candidate_n < 2:
+            if not quiet:
+                print("card candidate - confirming before lock")
+            self.status("CARD FOUND", "confirming card...", "amber")
+            return False
+        self.lock_candidate = None
+        self.lock_candidate_n = 0
 
         # Valid card: lock this round. All later calls use this saved copy.
         self.grid = grid
@@ -687,7 +714,7 @@ class App:
         self.pending_t0 = time.perf_counter()
         self.last_calls.add(key)
         self.pending_n = 0
-        self.commit(letter, num)
+        self.commit(letter, num, frame)
 
     def _instant_ball_active(self, frame, bboxes=None) -> bool:
         """True only while a real Instant Ball is on screen.
@@ -783,8 +810,14 @@ class App:
                 continue
             pos = V.locate_number(self.card, num)
             if pos is None:
-                print(f"instant {letter} {num} -> NOT ON CARD")
-                continue
+                unknown = self._unknown_daub_in_column(letter)
+                if unknown is not None:
+                    pos = unknown
+                    print(f"instant {letter} {num} -> r{pos[0] + 1}"
+                          f"c{pos[1] + 1} (daubed cell, value unread - uncertain)")
+                else:
+                    print(f"instant {letter} {num} -> NOT ON CARD")
+                    continue
             r, c = pos
             if self.daubed[r][c]:
                 continue
@@ -819,7 +852,65 @@ class App:
             # Allow a later frame to pick up any ball that failed OCR.
             self.last_ball_crop = None
 
-    def commit(self, letter: str, num: int) -> None:
+    @staticmethod
+    def _card_readable(card) -> int:
+        return sum(1 for row in card for v in row if v is not None)
+
+    def _unknown_daub_in_column(self, letter: str):
+        """The single daubed cell with no readable value in a ball's column.
+
+        A brand-new ticket never has these; they only exist when a daub hid
+        its digits from OCR. With exactly one such cell, a missed call in
+        that column almost certainly belongs to it.
+        """
+        if self.card is None:
+            return None
+        col = "BINGO".index(letter)
+        hits = [(r, c) for r in range(5) for c in range(5)
+                if (c == col and self.daubed[r][c]
+                    and self.card[r][c] is None
+                    and (r, c) not in self.free_cells)]
+        return hits[0] if len(hits) == 1 else None
+
+    def _verify_card(self, frame) -> None:
+        """One fresh-eyes re-read after a missed call.
+
+        A bad initial lock misses one call, then never heals: the wrong
+        value sits there for the rest of the round. This re-reads the card
+        without replaying locked daub values and patches at most three
+        disagreeing cells immediately.
+        """
+        if self.card is None or self.grid is None or frame is None:
+            return
+        now = time.time()
+        if now - self.last_verify < 2.0:
+            return
+        self.last_verify = now
+        warped = V.rectify(frame, self.grid)
+        if warped is None:
+            return
+        daubed_cells = {(r, c) for r in range(5) for c in range(5)
+                        if self.daubed[r][c]}
+        plain, plain_scores, plain_free = V.read_card_auto(
+            self.engine, warped, daubed=daubed_cells, old=None)
+        if V.validate_card(plain, plain_free):
+            return
+        if self._card_readable(plain) < ROUND_READABLE:
+            return
+        diff = [(r, c) for r in range(5) for c in range(5)
+                if plain[r][c] != self.card[r][c]]
+        if 1 <= len(diff) <= 3:
+            fixes = ", ".join(
+                f"r{r + 1}c{c + 1} "
+                f"{self.card[r][c] if self.card[r][c] else '?'}->{plain[r][c]}"
+                for r, c in diff)
+            for r, c in diff:
+                self.card[r][c] = plain[r][c]
+            self.card_scores = plain_scores
+            print("card corrected (miss re-read): " + fixes)
+            self.status("SCANNING", "card corrected", "green")
+
+    def commit(self, letter: str, num: int, frame=None) -> None:
         ms = (time.perf_counter() - self.pending_t0) * 1000 if self.pending_t0 else 0.0
         self.pending_t0 = 0.0
         self.instant_cells.clear()
@@ -827,6 +918,26 @@ class App:
         pos = V.locate_number(self.card, num)
         self.last_calls.add((letter, num))
         if pos is None:
+            # A daubed cell whose value was never readable may hold this
+            # ball: guide the column's single unknown daub instead of
+            # showing nothing and missing the call.
+            unknown = self._unknown_daub_in_column(letter)
+            if unknown is not None:
+                r, c = unknown
+                self.current_cells = [unknown]
+                self.pending_cells[unknown] = time.time()
+                self.highlight_deadline = time.time() + HIGHLIGHT_TIMEOUT
+                print(f"{letter} {num} -> r{r + 1}c{c + 1} (daubed cell, "
+                      "value unread - uncertain)")
+                self.status("SCANNING" if self.card_visible else "CARD HIDDEN",
+                            f"{letter} {num} -> r{r + 1}c{c + 1}? (daub)",
+                            "amber")
+                if self.card_visible and self.overlay_enabled:
+                    self.show_cells(*self.current_cells)
+                return
+            # Missed a call the card should have covered: re-read the card
+            # once with fresh eyes so a bad lock heals on the first miss.
+            self._verify_card(frame)
             print(f"{letter} {num} -> NOT ON CARD  ({ms:.0f} ms)")
             self.current_cells = []
             self.overlay.hide()
@@ -1181,8 +1292,51 @@ class App:
                         "green")
             return
 
-        # A different card. Confirm it once more before replacing the round:
-        # one bad read must never produce wrong highlights.
+        # A different card. The daub-aware read replays locked values into
+        # any ticket that shows up, so a switch may only ever be decided by
+        # a fresh-eyes re-read of the same frame that is nearly fully
+        # readable. This killed a live bug where a new ticket locked with
+        # the previous ticket's daub values grafted in.
+        plain, plain_scores, plain_free = V.read_card_auto(
+            self.engine, warped, daubed=daubed_cells, old=None)
+        if (V.validate_card(plain, plain_free)
+                or self._card_readable(plain) < ROUND_READABLE):
+            # Fading card, popup, or half-dealt ticket: keep the saved round
+            # and wait; recycled values must never replace a live round.
+            print("card change not confirmed - keeping saved round")
+            self.status("CARD HIDDEN", "waiting for card", "amber")
+            return
+        card, scores, free = plain, plain_scores, plain_free
+
+        diff_cells = [(r, c) for r in range(5) for c in range(5)
+                      if card[r][c] != self.card[r][c]]
+        if len(diff_cells) < ROUND_CHANGE:
+            # Same ticket: earlier reads misread a few digits. Patch the
+            # values in place without resetting the live round state.
+            if card == self.pending_card:
+                self.pending_card_n += 1
+            else:
+                self.pending_card = card
+                self.pending_card_n = 1
+            if self.pending_card_n < 2:
+                print("different card read - confirming before switching")
+                self.status("SCANNING", "confirming new card...", "amber")
+                return
+            self.pending_card = None
+            self.pending_card_n = 0
+            fixes = ", ".join(
+                f"r{r + 1}c{c + 1} "
+                f"{self.card[r][c] if self.card[r][c] else '?'}->{card[r][c]}"
+                for r, c in diff_cells)
+            for r, c in diff_cells:
+                self.card[r][c] = card[r][c]
+            self.card_scores = scores
+            print("card corrected: " + fixes)
+            self.status("SCANNING", "card corrected", "green")
+            return
+
+        # Confirmed big change: a real new round. Confirm once more before
+        # replacing the round; one bad read must never produce highlights.
         if card == self.pending_card:
             self.pending_card_n += 1
         else:
@@ -1193,6 +1347,9 @@ class App:
             print("different card read - confirming before switching")
             self.status("SCANNING", "confirming new card...", "amber")
             return
+
+        self.pending_card = None
+        self.pending_card_n = 0
 
         # Confirmed new round.
         print("\nnew round -> card changed")

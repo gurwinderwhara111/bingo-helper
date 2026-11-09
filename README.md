@@ -6,6 +6,32 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.11
+
+v1.11 fixes the failure chain found in the live session against
+web.worldwinner.com (the HTML5 game site), where the helper locked a new
+ticket with five numbers from the *previous* ticket grafted in, then missed
+`G 60`, `N 41` (three times) and flashed wrong holes for `O 65` and `N 40`:
+
+- **Round switches never reuse locked daub values.** v1.10's daub-aware
+  re-read replayed the previous ticket's daubed values into every new card
+  read, and both confirming reads replayed them identically, so a new ticket
+  locked corrupted. A switch is now only decided by a fresh-eyes re-read
+  (no value injection) that validates **and** has at least 23 readable cells.
+- **Missed calls heal the card.** A `NOT ON CARD` call now triggers one
+  rate-limited fresh re-read; up to three disagreeing cells are corrected
+  in place (log: `card corrected (miss re-read): ...`).
+- **Unknown-daub cells guide missed calls.** If exactly one daubed cell in
+  the ball's column has no readable value, the hole is shown there with an
+  "uncertain" label instead of nothing.
+- **Small same-ticket diffs correct instead of resetting.** Fewer than 12
+  differing cells on a confirmed fresh read patch the values in place and
+  keep the live round (`card corrected: ...`); only big changes declare a
+  new round.
+- **Initial scans require two agreeing reads** before locking, and grids
+  narrower than 300 px get a "maximize the window" warning because small
+  cells multiply OCR errors.
+
 ## Version 1.10
 
 v1.10 fixes the top live-play failures found while fact-checking the HTML5

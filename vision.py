@@ -380,8 +380,9 @@ def read_card_fast(warped, templates=None, size: int = CANON,
         for c in range(5):
             if r == 2 and c == 2:
                 continue
-            if (daubed and (r, c) in daubed
-                    and old is not None and old[r][c] is not None):
+            daub_guard = bool(daubed) and (r, c) in daubed
+            if (daub_guard and old is not None
+                    and old[r][c] is not None):
                 # A pixel-confirmed daub keeps its locked number: redeciding
                 # it from under the orange fill recreated fake new rounds.
                 values[r][c] = old[r][c]
@@ -411,6 +412,10 @@ def read_card_fast(warped, templates=None, size: int = CANON,
                     number = 0
 
             if not digits or not number:
+                # A daubed cell with no locked value is unknown: the orange
+                # fill is a daub, not a pumpkin, so it is never a free cell.
+                if daub_guard:
+                    continue
                 # Only a cell that cannot be read as a number may be a
                 # pumpkin/free cell.  A just-daubed number cell must stay a
                 # number, or a whole card can look "free".
@@ -480,8 +485,9 @@ def read_card_ex(engine, warped, size: int = CANON, daubed=None, old=None):
         for c in range(5):
             if r == 2 and c == 2:
                 continue
-            if (daubed and (r, c) in daubed
-                    and old is not None and old[r][c] is not None):
+            daub_guard = bool(daubed) and (r, c) in daubed
+            if (daub_guard and old is not None
+                    and old[r][c] is not None):
                 values[r][c] = old[r][c]
                 scores[r][c] = 0.90
                 continue
@@ -500,6 +506,9 @@ def read_card_ex(engine, warped, size: int = CANON, daubed=None, old=None):
             if v:
                 values[r][c] = v
                 scores[r][c] = sc
+                continue
+            if daub_guard:
+                # Daubed but never readable: unknown, never free.
                 continue
             if is_free_cell(cell):
                 free[r][c] = True
