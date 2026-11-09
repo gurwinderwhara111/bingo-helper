@@ -354,12 +354,17 @@ def match_digit_mask(mask, templates: tuple[np.ndarray, tuple[str, ...]]) -> tup
     return label, float(scores[idx])
 
 
-def read_card_fast(warped, templates=None, size: int = CANON):
+def read_card_fast(warped, templates=None, size: int = CANON,
+                   daubed=None, old=None):
     """Read a 5x5 card using digit templates instead of OCR.
 
     Returns the same shape as ``read_card_ex``.  Any unreadable or
     out-of-column number is left as ``None`` so ``validate_card`` can reject
     it before an overlay is ever shown.
+
+    ``daubed`` plus ``old`` carry a locked round's knowledge: known-daubed
+    number cells reuse their saved value and skip template matching, so an
+    orange daub fill can never mark them as free/wild cells.
     """
     if templates is None:
         templates = load_digit_templates()
@@ -374,6 +379,13 @@ def read_card_fast(warped, templates=None, size: int = CANON):
     for r in range(5):
         for c in range(5):
             if r == 2 and c == 2:
+                continue
+            if (daubed and (r, c) in daubed
+                    and old is not None and old[r][c] is not None):
+                # A pixel-confirmed daub keeps its locked number: redeciding
+                # it from under the orange fill recreated fake new rounds.
+                values[r][c] = old[r][c]
+                scores[r][c] = 0.90
                 continue
             cell = cell_img(warped, r, c, size=size)
 
@@ -413,9 +425,9 @@ def read_card_fast(warped, templates=None, size: int = CANON):
     return values, scores, free
 
 
-def read_card_auto(engine, warped, size: int = CANON):
+def read_card_auto(engine, warped, size: int = CANON, daubed=None, old=None):
     """Fast template card read, with an OCR fallback for safety."""
-    fast = read_card_fast(warped, size=size)
+    fast = read_card_fast(warped, size=size, daubed=daubed, old=old)
     if fast is not None:
         values, scores, free = fast
         issues = validate_card(values, free)
@@ -423,7 +435,7 @@ def read_card_auto(engine, warped, size: int = CANON):
                 if not free[r][c] and values[r][c] is not None]
         if not issues and good and min(good) >= FAST_DIGIT_MIN_SCORE:
             return values, scores, free
-    return read_card_ex(engine, warped, size=size)
+    return read_card_ex(engine, warped, size=size, daubed=daubed, old=old)
 
 
 # ---------------------------------------------------------------- OCR
@@ -453,8 +465,13 @@ def is_free_cell(cell, min_ratio: float = 0.28) -> bool:
     return float(orange.mean()) >= min_ratio
 
 
-def read_card_ex(engine, warped, size: int = CANON):
-    """Read the 5x5 card and also report visually confirmed free/wild cells."""
+def read_card_ex(engine, warped, size: int = CANON, daubed=None, old=None):
+    """Read the 5x5 card and also report visually confirmed free/wild cells.
+
+    ``daubed`` plus ``old`` carry a locked round's knowledge: a pixel-confirmed
+    daubed number cell reuses its locked value instead of being redecided, so
+    an orange daub fill can never mark it as a free/wild cell.
+    """
     values = [[None] * 5 for _ in range(5)]
     scores = [[0.0] * 5 for _ in range(5)]
     free = [[False] * 5 for _ in range(5)]
@@ -463,15 +480,27 @@ def read_card_ex(engine, warped, size: int = CANON):
         for c in range(5):
             if r == 2 and c == 2:
                 continue
+            if (daubed and (r, c) in daubed
+                    and old is not None and old[r][c] is not None):
+                values[r][c] = old[r][c]
+                scores[r][c] = 0.90
+                continue
             cell = cell_img(warped, r, c, size=size)
             txt, sc = ocr(engine, cell)
-            digits = "".join(ch for ch in txt if ch.isdigit())
+            # RapidOCR sometimes returns unicode digits such as '²' or '⑤'
+            # that pass isdigit() but crash int(); use ASCII digits only.
+            digits = "".join(ch for ch in txt
+                             if ch.isascii() and ch.isdecimal())
+            v = 0
+            lo, hi = COL_RANGES[c]
             if 1 <= len(digits) <= 2:
-                v = int(digits)
-                if 1 <= v <= 75:
-                    values[r][c] = v
-                    scores[r][c] = sc
-                    continue
+                num = int(digits)
+                if 1 <= num <= 75 and lo <= num <= hi:
+                    v = num
+            if v:
+                values[r][c] = v
+                scores[r][c] = sc
+                continue
             if is_free_cell(cell):
                 free[r][c] = True
     return values, scores, free
@@ -705,7 +734,8 @@ def read_ball(engine, img, bbox, fast: bool = False):
                 letter, letter_sc = t.upper(), sc
             continue
 
-        digits = "".join(ch for ch in t if ch.isdigit())
+        digits = "".join(ch for ch in t
+                         if ch.isascii() and ch.isdecimal())
         if 1 <= len(digits) <= 2:
             number, number_sc = int(digits), sc
         elif not two_bands and t.upper() in LETTERS and len(t) == 1:

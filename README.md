@@ -6,6 +6,26 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.10
+
+v1.10 fixes the top live-play failures found while fact-checking the HTML5
+clone review against `bingo.log` and the gameplay videos:
+
+- **`int()` digit crash fixed.** RapidOCR can return unicode digits such as
+  `'²'`, `'¹'` or `'⑤'`; those passed `isdigit()` but crashed `int()` (7 hard
+  crashes in the log). Only ASCII decimal digits are accepted now, in both the
+  card reader and the ball reader.
+- **Daubed cells never become "free".** When the card is re-read mid-round,
+  pixel-confirmed daubed cells reuse their locked number and skip redeciding,
+  so an orange daub fill can no longer trigger fake "new round" wipes. Re-reads
+  are also faster because daubed cells skip template matching/OCR entirely.
+- **Pick Me Up retries a half-read popup.** The four offered balls pop in one
+  by one; instead of locking in "manual" from the first frame, the popup is
+  re-read every ~0.25 s and only falls back when it closes unread.
+- **Stale free/wild ghosts are retracted.** If a later clean read says a cell
+  is a number again, the ghost free marking is removed and the daub matrix is
+  corrected. 22 ghost events and 13 fake round wipes were in the live log.
+
 ## Version 1.9
 
 v1.9 changes normal call handling to prioritize **zero missed guidance**:

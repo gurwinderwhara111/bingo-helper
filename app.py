@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.9"
+VERSION = "1.10"
 
 logging.disable(logging.INFO)
 
@@ -47,6 +47,7 @@ ROUND_CHECK = 0.3      # seconds between cheap cell-change checks
 HIGHLIGHT_TIMEOUT = 0.0 # 0 disables stale auto-hide: never remove valid guidance
 GRID_STABLE_DIFF = 8.0 # saved grid-crop diff below this means "grid has not moved"
 POPUP_RETRY = 0.5      # seconds between failed Pick Me Up title reads
+PICK_RETRY = 0.25      # seconds between Pick Me Up reads while balls pop in
 BALL_SCORE = 0.92      # minimum OCR confidence for a normal ball
 INSTANT_SCORE = 0.92   # minimum OCR confidence for an Instant Ball number
 
@@ -205,6 +206,7 @@ class App:
         self.detect_fail = 0
         self.popup = None             # cached Pick Me Up result
         self.last_popup_check = 0.0
+        self.popup_wait_until = 0.0   # holding state while offers pop in
         self.last_popup_text = ""
         self.last_instant_check = 0.0
         self.instant_banner = None
@@ -616,6 +618,7 @@ class App:
         self.last_round_ocr = 0.0
         self.popup = None
         self.last_popup_check = 0.0
+        self.popup_wait_until = 0.0
         self._capture_baseline(frame)
         self.last_grid_crop = frame[grid.y0:grid.y1, grid.x0:grid.x1].copy()
         self.overlay.hide()
@@ -902,6 +905,10 @@ class App:
         if self.card is None:
             return False
         now = time.time()
+        if now < self.popup_wait_until:
+            # Offered balls are still animating in; treat the popup as
+            # handled until the next retry so its ball reads are not wasted.
+            return True
         if now - self.last_popup_check < POPUP_RETRY:
             return False
         self.last_popup_check = now
@@ -960,11 +967,13 @@ class App:
             return True
 
         if len(offers) < 4:
-            self.popup = {"offers": tuple(offers), "best": None, "manual": True,
-                          "reason": "could not read 4 balls", "t": now,
-                          "title": title}
-            self.status("PICK ME UP", "read failed - choose manually", "amber")
-            print("PICK ME UP: fewer than 4 balls read - manual")
+            # The offered balls pop in one by one.  Do not lock a half-read
+            # popup as "manual": re-read it shortly and only fall back when
+            # the popup closes before all four balls can be read.
+            self.popup = None
+            self.popup_wait_until = now + PICK_RETRY
+            self.status("PICK ME UP", "reading offers...", "amber")
+            print(f"PICK ME UP: {len(offers)} of 4 balls read - retrying")
             return True
 
         choices = B.rank_picks(self.card, self.daubed, offers)
@@ -1123,7 +1132,11 @@ class App:
         # OCR only when the cells really changed.  The fast template path is
         # tried first and falls back to OCR when anything is unreadable.
         warped = V.rectify(frame, grid)
-        card, scores, free = V.read_card_auto(self.engine, warped)
+        daubed_cells = {(r, c) for r in range(5) for c in range(5)
+                        if self.daubed[r][c]}
+        card, scores, free = V.read_card_auto(self.engine, warped,
+                                              daubed=daubed_cells,
+                                              old=self.card)
 
         if V.validate_card(card, free):
             # Covered, mid-deal, or unreadable. Keep the saved round and wait.
@@ -1143,6 +1156,18 @@ class App:
                 self.free_cells |= new_free
                 for r, c in new_free:
                     self._mark_daubed(r, c)
+            # A clean later read can retract a stale free/wild ghost cell
+            # that an earlier bad read left on the board.
+            dropped = self.free_cells - new_free
+            if dropped:
+                self.free_cells -= dropped
+                for r, c in sorted(dropped):
+                    if self.daubed[r][c]:
+                        self.daubed[r][c] = False
+                        self.line_counts = B.line_counts(self.daubed)
+                print("free/wild retracted: "
+                      + ", ".join(f"r{r + 1}c{c + 1}"
+                                  for r, c in sorted(dropped)))
             self.grid = grid
             self.card_scores = scores
             self.pending_card = None

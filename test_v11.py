@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 import bingo as B
 import vision as V
@@ -204,6 +205,38 @@ class VisionTests(unittest.TestCase):
         self.assertEqual([(r, c) for r in range(5) for c in range(5) if free[r][c]],
                          [(1, 2), (2, 2)])
         self.assertEqual(values, ocr_values)
+
+    def test_known_daub_reuses_saved_number(self):
+        # An orange daub fill hides the digits; a locked round must keep the
+        # saved number and must never mark the cell as a free/wild cell.
+        warped = np.full((500, 500, 3), 255, np.uint8)
+        warped[8:92, 8:92] = (109, 156, 237)  # BGR of #ED9C7D orange daub
+        old = [[44, None, None, None, None] for _ in range(5)]
+        values, scores, free = V.read_card_fast(warped, daubed={(0, 0)},
+                                                old=old)
+        self.assertEqual(values[0][0], 44)
+        self.assertFalse(free[0][0])
+        # Without daub knowledge the same cell falls back to free marking.
+        values2, _scores2, free2 = V.read_card_fast(warped)
+        self.assertIsNone(values2[0][0])
+        self.assertTrue(free2[0][0])
+
+    def test_ocr_unicode_digit_does_not_crash(self):
+        # RapidOCR once returned '²'/'¹'/'⑤' digits that passed isdigit()
+        # but crashed int() (7 crashes in bingo.log).  ASCII digits only.
+        class _Out:
+            def __init__(self, txts):
+                self.txts = tuple(txts)
+                self.scores = tuple(0.99 for _ in txts)
+
+        class _Engine:
+            def __call__(self, img, **kwargs):
+                return _Out(["²", "¹"])
+
+        warped = np.zeros((500, 500, 3), np.uint8)
+        values, _scores, free = V.read_card_ex(_Engine(), warped)
+        self.assertIsNone(values[0][0])
+        self.assertFalse(free[0][0])
 
     def test_instant_ball_layout_detected(self):
         # The real power-up screenshot itself must be recognized.
