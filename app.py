@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.11"
+VERSION = "1.12"
 
 logging.disable(logging.INFO)
 
@@ -182,8 +182,11 @@ class App:
         self.daubed = B.initial_daubed()
         self.line_counts = B.line_counts(self.daubed)
         self.last_calls: set[tuple[str, int]] = set()
+        self.not_on_card: dict[tuple[str, int], float] = {}
+        self.last_unread_log = 0.0
         self.current_cells: list[tuple[int, int]] = []
         self.instant_cells: set[tuple[int, int]] = set()
+        self.instant_offered: set[tuple[str, int]] = set()
         self.pending_cells: dict[tuple[int, int], float] = {}
         self.pending: tuple[str, int] | None = None
         self.pending_n = 0
@@ -307,6 +310,8 @@ class App:
         self.daubed = B.initial_daubed()
         self.line_counts = B.line_counts(self.daubed)
         self.last_calls.clear()
+        self.not_on_card.clear()
+        self.instant_offered.clear()
         self.current_cells = []
         self.instant_cells.clear()
         self.pending_cells.clear()
@@ -633,8 +638,10 @@ class App:
         self.card_scores = scores
         initial_daubs = self._seed_daubs(warped, free)
         self.last_calls.clear()
+        self.not_on_card.clear()
         self.current_cells = []
         self.instant_cells.clear()
+        self.instant_offered.clear()
         self.pending_cells.clear()
         self.pending = None
         self.pending_n = 0
@@ -696,6 +703,13 @@ class App:
         num = ball["number"]
         if num is None or not (1 <= num <= 75) or ball["number_score"] < BALL_SCORE:
             self.last_ball_crop = None  # retry the read, keep any pending call
+            # A miss must never be silent: log it (throttled) so a ball that
+            # was on screen and never read leaves a trace in bingo.log.
+            nowt = time.time()
+            if nowt - self.last_unread_log >= 1.0:
+                self.last_unread_log = nowt
+                print(f"ball unread (score {ball['number_score']:.2f})"
+                      " - retrying")
             return
 
         derived = V.letter_for(num)
@@ -737,7 +751,16 @@ class App:
         return self.instant_active
 
     def poll_ball(self, frame) -> None:
-        if not self.card_visible or self.popup is not None:
+        if self.card is None:
+            return
+        # Ball reads keep running while a Pick Me Up-style popup is open:
+        # the WorldWinner clock keeps running during these power-ups, so a
+        # normal call that arrives in that window is a real ball that must
+        # not be dropped.  Commits are safe then: locating a number uses the
+        # saved card, and missing highlights revive when the card returns.
+        # (Card hidden WITHOUT a popup - fading card, unconfirmed switch -
+        # still suppresses reads, exactly as before.)
+        if not self.card_visible and self.popup is None:
             return
         x0, y0, x1, y1 = self._ball_region(frame)
         crop = frame[y0:y1, x0:x1]
@@ -752,11 +775,12 @@ class App:
             return
         self.last_ball_crop = crop.copy()
 
-        # A pink popup title over a mostly covered card means Pick Me Up (or
-        # another modal). Do not read its offered balls as called balls; let
-        # check_round process the popup. Instant Ball also has a pink banner,
-        # but its card is still visible, so changed stays low.
-        if (V.find_pink_band(frame) is not None
+        # A pink modal whose title physically starts above the card covers
+        # the ball strip itself - its own balls would pollute every read, so
+        # skip this frame.  A title lower on the card (Pick Me Up over the
+        # card body) leaves the strip untouched and reads continue.
+        band = V.find_pink_band(frame)
+        if (band is not None and band[1] < self.grid.y0
                 and self._changed_cells(frame) >= ROUND_CHANGE):
             return
 
@@ -776,14 +800,19 @@ class App:
         # produce several boxes; only the game's INSTANT BALL banner makes
         # those balls count, otherwise treat it as one current ball.
         if len(bboxes) >= 2:
-            self.last_popup_check = 0.0
-            if self._check_pick_me_up(frame):
-                return
+            # Only scan for a new popup title when none is known; an active
+            # popup is maintained in check_round, and re-blocking ball reads
+            # here is what used to freeze normal detection for whole popups.
+            if self.popup is None:
+                self.last_popup_check = 0.0
+                if self._check_pick_me_up(frame):
+                    return
             if self._instant_ball_active(frame, bboxes):
                 self._poll_instant(frame, bboxes)
                 return
-            # Current ball sits to the right of the call history.
-            bbox = max(bboxes, key=lambda b: b[0])
+            # The current ball is the largest ball on screen; history balls
+            # are smaller.  Prefer area, tie in favour of the right.
+            bbox = max(bboxes, key=lambda b: (b[2] * b[3], b[0]))
             self._handle_ball(frame, bbox)
             return
 
@@ -794,6 +823,7 @@ class App:
         """Read all large balls and show all matching holes together."""
         found = []
         unread = 0
+        max_unread = 0.0
         for bbox in bboxes:
             ball = V.read_ball_robust(self.engine, frame, bbox,
                                       min_score=INSTANT_SCORE)
@@ -801,6 +831,7 @@ class App:
             if (num is None or not (1 <= num <= 75)
                     or ball["number_score"] < INSTANT_SCORE):
                 unread += 1
+                max_unread = max(max_unread, ball["number_score"])
                 continue
             letter = V.letter_for(num) or "?"
             key = (letter, num)
@@ -810,14 +841,13 @@ class App:
                 continue
             pos = V.locate_number(self.card, num)
             if pos is None:
-                unknown = self._unknown_daub_in_column(letter)
-                if unknown is not None:
-                    pos = unknown
-                    print(f"instant {letter} {num} -> r{pos[0] + 1}"
-                          f"c{pos[1] + 1} (daubed cell, value unread - uncertain)")
-                else:
-                    print(f"instant {letter} {num} -> NOT ON CARD")
-                    continue
+                # Powerup offer balls: announce each distinct number once
+                # and move on.  Never guide a daub for a ball that is not
+                # on the card (wrong daubs cost points).
+                if key not in self.instant_offered:
+                    self.instant_offered.add(key)
+                    print(f"powerup offer {letter} {num} - not on card")
+                continue
             r, c = pos
             if self.daubed[r][c]:
                 continue
@@ -825,6 +855,11 @@ class App:
 
         if not found:
             if unread:
+                nowt = time.time()
+                if nowt - self.last_unread_log >= 1.0:
+                    self.last_unread_log = nowt
+                    print(f"instant ball unread (best score "
+                          f"{max_unread:.2f}) - retrying")
                 self.last_ball_crop = None
             return
 
@@ -855,22 +890,6 @@ class App:
     @staticmethod
     def _card_readable(card) -> int:
         return sum(1 for row in card for v in row if v is not None)
-
-    def _unknown_daub_in_column(self, letter: str):
-        """The single daubed cell with no readable value in a ball's column.
-
-        A brand-new ticket never has these; they only exist when a daub hid
-        its digits from OCR. With exactly one such cell, a missed call in
-        that column almost certainly belongs to it.
-        """
-        if self.card is None:
-            return None
-        col = "BINGO".index(letter)
-        hits = [(r, c) for r in range(5) for c in range(5)
-                if (c == col and self.daubed[r][c]
-                    and self.card[r][c] is None
-                    and (r, c) not in self.free_cells)]
-        return hits[0] if len(hits) == 1 else None
 
     def _verify_card(self, frame) -> None:
         """One fresh-eyes re-read after a missed call.
@@ -909,48 +928,61 @@ class App:
             self.card_scores = plain_scores
             print("card corrected (miss re-read): " + fixes)
             self.status("SCANNING", "card corrected", "green")
+            self._retry_missed()
+
+    def _retry_missed(self) -> None:
+        """Re-commit balls scored NOT ON CARD before the card healed.
+
+        commit() keys a ball into last_calls before it knows whether the
+        card covers it; a self-healed card otherwise can never highlight
+        that ball again.  This is the release valve.
+        """
+        if not self.not_on_card:
+            return
+        for key in [k for k, t in self.not_on_card.items()
+                    if time.time() - t < 30.0]:
+            letter, num = key
+            if self.card is None or V.locate_number(self.card, num) is None:
+                continue
+            self.not_on_card.pop(key)
+            self.last_calls.discard(key)
+            self.commit(letter, num, frame=None)
 
     def commit(self, letter: str, num: int, frame=None) -> None:
         ms = (time.perf_counter() - self.pending_t0) * 1000 if self.pending_t0 else 0.0
         self.pending_t0 = 0.0
         self.instant_cells.clear()
+        self.instant_offered.clear()
         self.highlight_deadline = 0.0
         pos = V.locate_number(self.card, num)
+        # pre-add keeps an already-seen ball from re-committing every poll
         self.last_calls.add((letter, num))
         if pos is None:
-            # A daubed cell whose value was never readable may hold this
-            # ball: guide the column's single unknown daub instead of
-            # showing nothing and missing the call.
-            unknown = self._unknown_daub_in_column(letter)
-            if unknown is not None:
-                r, c = unknown
-                self.current_cells = [unknown]
-                self.pending_cells[unknown] = time.time()
-                self.highlight_deadline = time.time() + HIGHLIGHT_TIMEOUT
-                print(f"{letter} {num} -> r{r + 1}c{c + 1} (daubed cell, "
-                      "value unread - uncertain)")
-                self.status("SCANNING" if self.card_visible else "CARD HIDDEN",
-                            f"{letter} {num} -> r{r + 1}c{c + 1}? (daub)",
-                            "amber")
-                if self.card_visible and self.overlay_enabled:
-                    self.show_cells(*self.current_cells)
-                return
+            # Wrong daubs cost -100 points in the live game, and most
+            # NOT-ON-CARD calls are genuinely not on the card: no guessing
+            # a daub on an unreadable cell.  Remember the miss instead, so
+            # a later self-healed card can re-commit this ball and finally
+            # light it up.
+            self.not_on_card[(letter, num)] = time.time()
             # Missed a call the card should have covered: re-read the card
             # once with fresh eyes so a bad lock heals on the first miss.
             self._verify_card(frame)
             print(f"{letter} {num} -> NOT ON CARD  ({ms:.0f} ms)")
             self.current_cells = []
-            self.overlay.hide()
+            if self.overlay is not None:
+                self.overlay.hide()
             self.status("SCANNING" if self.card_visible else "CARD HIDDEN",
                         f"{letter} {num} -> not on card",
                         "green" if self.card_visible else "amber")
             return
+        self.not_on_card.pop((letter, num), None)
 
         r, c = pos
         if self.daubed[r][c]:
             print(f"{letter} {num} -> r{r + 1}c{c + 1} already daubed")
             self.current_cells = []
-            self.overlay.hide()
+            if self.overlay is not None:
+                self.overlay.hide()
             self.status("SCANNING" if self.card_visible else "CARD HIDDEN",
                         f"{letter} {num} -> already daubed",
                         "green" if self.card_visible else "amber")
@@ -1011,6 +1043,7 @@ class App:
             if title is None or band is None or self._rect_iou(band, title) < 0.20:
                 print("popup gone")
                 self.popup = None
+                self.instant_offered.clear()
                 return False
             return True
         if self.card is None:
@@ -1208,6 +1241,7 @@ class App:
                     return
                 print("popup cleared")
                 self.popup = None
+                self.instant_offered.clear()
             if not moved:
                 self._apply_daubs(diffs, frame)
             if moved:
@@ -1333,6 +1367,9 @@ class App:
             self.card_scores = scores
             print("card corrected: " + fixes)
             self.status("SCANNING", "card corrected", "green")
+            # Ball calls that were scored NOT ON CARD against the broken
+            # card may be on the card now: release and re-commit them.
+            self._retry_missed()
             return
 
         # Confirmed big change: a real new round. Confirm once more before
@@ -1358,8 +1395,10 @@ class App:
         self.card_scores = scores
         initial_daubs = self._seed_daubs(warped, free)
         self.last_calls.clear()
+        self.not_on_card.clear()
         self.current_cells = []
         self.instant_cells.clear()
+        self.instant_offered.clear()
         self.pending_cells.clear()
         self.pending = None
         self.pending_n = 0

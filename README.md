@@ -6,6 +6,45 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.12
+
+v1.12 fixes the three reliability complaints from live play: normal calls
+being dropped while a power-up popup was open, silent normal-play ball misses,
+and wrong-daub advice. Backed by a live-log forensics pass, a web fact-check
+of WorldWinner rules, and an internal simulation of all 75 ball values:
+
+- **Ball reads keep running during Pick Me Up.** The WorldWinner clock keeps
+  running while the popup is open, so normal calls arriving in that window
+  are real. `poll_ball` no longer hard-returns while a popup is known; it
+  only skips frames whose modal title band physically covers the ball strip.
+  Commits during a popup are safe: they locate against the saved card, and
+  highlights revive when the card reappears.
+- **The uncertain-daub advice is removed.** Wrong daubs cost -100 points and
+  most NOT-ON-CARD calls are genuinely not on the card, so guiding a daub on
+  an unreadable cell was negative-value advice (complaint: it showed
+  "choose this next daub" instead of the ball).
+- **Gone-forever misses fixed.** `commit()` keyed every ball into
+  `last_calls` before knowing whether the card covers it, so a ball wrongly
+  scored NOT ON CARD against a bad card could never highlight after the card
+  healed. Missed keys are now remembered (`not_on_card`) and released the
+  moment any card correction lands (`_retry_missed`), re-committing and
+  lighting the call.
+- **Powerup offers print once.** The floating 3-ball Instant offers that are
+  not on the card were re-read and re-printed every 120 ms (live log showed
+  `instant G 52 -> NOT ON CARD` seven times). Offer keys now dedupe for the
+  rest of the window and announce as `powerup offer ... - not on card`.
+- **No silent misses.** Reads below `BALL_SCORE` used to vanish without a
+  trace. They now log throttled (`ball unread (score 0.83) - retrying`,
+  `instant ball unread ...`) so every miss is diagnosable in `bingo.log`.
+- **Multi-ball frames pick the biggest ball.** The current ball is the
+  largest on screen; the old right-most rule could lose it.
+- **All-75 verification harness.** `tools/simulate_numbers.py` renders every
+  bingo value 1..75 (game style, five grid widths, clean and fully daubed)
+  and reads them back with the production readers: the OCR fallback path
+  reads 75/75 at every width; the ball readers read 75/75 at every size
+  40-64 px. Plus 7 new app-level regression tests (test_v12.py) covering the
+  popup gate, the heal-and-recommit path, and offer bookkeeping.
+
 ## Version 1.11
 
 v1.11 fixes the failure chain found in the live session against
