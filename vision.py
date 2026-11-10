@@ -626,37 +626,100 @@ def _ball_candidates(img, grid: Grid):
     return _ball_candidates_color(img, grid)
 
 
-def find_ball(img, grid: Grid):
-    """Largest saturated, roughly-circular blob above the grid = current ball.
+# ---- v1.13 ball selection (validated, see tools/test_ballpick.py) ----------
+# v1.12 resolved the current ball as "largest candidate wins".  On the
+# labelled screenshot corpus that picked the seated-cat blob instead of the
+# real ball in 18/28 files: Hough draws a big pale circle around the cat and
+# the history balls sit at its bottom edge, so that blob out-sizes the real
+# ball and its OCR crop reads a fragment with 0.98-1.00 confidence.
+# Measured replacement (28 files, value confirmed by production OCR):
+#   OLD largest            10/28
+#   hot-zone + size band   28/28 (at every zone width 0.50-0.65)
+# Ring/face identity probes were tested and REJECTED: Hough box offsets
+# collapse the ring measurement on real balls (0.006-0.01 on the 42px
+# history balls) while cat phantoms still measure up to 0.42 - the
+# distributions overlap, so identity probes only break real balls.
+BALL_ZONE_FRAC = 0.60   # live ball sits right of this fraction of width
+BALL_DMIN_F = 0.80      # drawn-ball diameter band, relative to grid cell
+BALL_DMAX_F = 1.35
 
-    Colour-agnostic on purpose: B/I/N/G/O balls use five different hues, and
-    the call history shows smaller balls of the same hues.
+def _ball_zone_pool(cands, grid: Grid):
+    """Candidates that can be the live ball: size band first, then hot zone.
+
+    Falls back to the whole size band, then to every candidate, so a solo
+    ball that parks mid-window (round transitions) is still found.
     """
-    cands = _ball_candidates(img, grid)
+    cell = (grid.x1 - grid.x0) / 5.0
+    zx = grid.x0 + BALL_ZONE_FRAC * (grid.x1 - grid.x0)
+    banded = [c for c in cands
+              if BALL_DMIN_F * cell <= (c[2] + c[3]) / 2 <= BALL_DMAX_F * cell]
+    hot = [c for c in banded if c[0] + c[2] / 2 >= zx]
+    if hot:
+        return hot
+    return banded or list(cands)
+
+def select_current(cands, grid: Grid):
+    """The live ball box from any candidate list (v1.13 validated rule).
+
+    Rightmost member of the size band inside the hot zone: the game always
+    enters the new ball at the right of the strip, the cat blob never gets
+    there, and the drawn ball size is bounded by the card cell.
+    """
     if not cands:
         return None
-    # Largest wins; on a tie the right-most wins (current ball sits right of
-    # the call history, which can use the same ball size).
-    best = max(cands, key=lambda c: (c[2] * c[3], c[0]))
-    return best[:4]
+    return max(_ball_zone_pool(cands, grid), key=lambda c: c[0])[:4]
 
+def find_ball(img, grid: Grid):
+    """Current ball: hot-zone + size-band member, rightmost (v1.13)."""
+    cands = _ball_candidates(img, grid)
+    return select_current(cands, grid)
+
+def _ball_clusters(cands, cell):
+    """Merge boxes that cover the same drawn ball, keep readable ones.
+
+    Hough draws offset/oversized duplicates of one ball; merging by centre
+    proximity and keeping the box closest to the typical band size retains
+    the box whose crop is centred on the digits.
+    """
+    keep = [c for c in cands
+            if BALL_DMIN_F * cell <= (c[2] + c[3]) / 2 <= BALL_DMAX_F * cell]
+    if not keep:
+        keep = list(cands)
+    ds = sorted((c[2] + c[3]) / 2 for c in keep)
+    typical = ds[len(ds) // 2]
+    reps = []
+    for c in sorted(keep, key=lambda c: -c[2] * c[3]):
+        for i, r in enumerate(reps):
+            cx, cy = c[0] + c[2] / 2, c[1] + c[3] / 2
+            rx, ry = r[0] + r[2] / 2, r[1] + r[3] / 2
+            dist = ((cx - rx) ** 2 + (cy - ry) ** 2) ** 0.5
+            if dist <= 0.75 * max((c[2] + c[3]) / 2, (r[2] + r[3]) / 2):
+                if abs((c[2] + c[3]) / 2 - typical) < \
+                        abs((r[2] + r[3]) / 2 - typical):
+                    reps[i] = c
+                break
+        else:
+            reps.append(c)
+    return reps
 
 def find_balls(img, grid: Grid, max_balls: int = 3):
-    """Return the large, current ball cluster above the grid.
+    """The large live balls above the grid (Instant Ball shows 2-3).
 
-    Instant Ball shows 2-3 large balls at the same time.  Call-history balls
-    are smaller, so keeping only blobs near the largest radius separates the
-    current call(s) from history.  Normal play usually returns one ball.
+    v1.12 kept every blob within 68% of the largest radius, so one
+    over-sized cat blob inflated the ceiling and pushed the real balls out.
+    Selection now uses the size band plus centre-proximity clustering:
+    duplicate circles collapse to one ball, cat blobs never enter the
+    radius ranking, and history balls stay below the band.
     """
     cands = _ball_candidates(img, grid)
     if not cands:
         return []
-    max_r = max(c[2] / 2 for c in cands)
-    keep = [c for c in cands if c[2] / 2 >= 0.68 * max_r]
-    keep.sort(key=lambda c: (c[2] * c[3], c[0]), reverse=True)
-    keep = keep[:max_balls]
-    keep.sort(key=lambda c: c[0])
-    return [c[:4] for c in keep]
+    reps = _ball_clusters(cands, (grid.x1 - grid.x0) / 5.0)
+    reps.sort(key=lambda c: -c[2] * c[3])
+    reps = reps[:max_balls]
+    reps.sort(key=lambda c: c[0])
+    return [c[:4] for c in reps]
+
 
 
 def _row_bands(th):

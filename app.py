@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.12"
+VERSION = "1.13"
 
 logging.disable(logging.INFO)
 
@@ -810,9 +810,11 @@ class App:
             if self._instant_ball_active(frame, bboxes):
                 self._poll_instant(frame, bboxes)
                 return
-            # The current ball is the largest ball on screen; history balls
-            # are smaller.  Prefer area, tie in favour of the right.
-            bbox = max(bboxes, key=lambda b: (b[2] * b[3], b[0]))
+            # Current ball, geometry-validated (v1.13): hot-zone + size band
+            # + rightmost.  "Largest wins" read the seated cat blob instead of
+            # the real ball in 18/28 files on the labelled corpus.
+
+            bbox = V.select_current(bboxes, self.grid)
             self._handle_ball(frame, bbox)
             return
 

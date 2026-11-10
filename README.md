@@ -6,6 +6,43 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.13
+
+v1.13 fixes the last false-highlight source found after v1.12: the
+current-ball selector. A live-log forensics pass plus a 28-screenshot
+accuracy audit on the user-collected corpus (human-verified ground truth,
+every screenshot read by eye) showed the OCR itself was right 117/118 -
+but box selection read the seated cat instead of the ball in 18/28 files:
+
+- **Validated current-ball selection.** `V.select_current()` replaces
+  "largest candidate wins": hot zone (`cx >= grid.x0 + 0.60*width`) plus
+  the drawn-ball size band (`[0.80, 1.35]` of the card cell), rightmost
+  box. On the labelled corpus: old rule 10/28, new rule 28/28, stable at
+  every zone width 0.50-0.65. Ring/face identity probes were tested and
+  rejected on measurement (real 42px history balls measure as low as
+  0.006 saturated-ring fraction while cat phantoms still reach 0.42).
+- **Multi-ball frames use the same rule.** `poll_ball` picked the biggest
+  of the `find_balls` boxes, re-introducing the same bug; it now calls
+  `select_current`. `find_balls` itself clusters duplicate circles by
+  centre proximity (keeps the typical-size box) and stays inside the size
+  band, so one over-sized blob can no longer poison the radius ratio.
+- **Measured A/B on both replay videos** (tools/test_ballpick.py,
+  debug/eval/v12_events_* vs v13_events_*): +5 real balls the old rule
+  never read, -4 cat-blob fragment calls ("B8"->"B6", "B9"->"B7"
+  split-reads), earlier reads (up to 11.6s), no new wrong highlights.
+- **Corpus accuracy harness.** tools/eval_screenshots.py scores every
+  screenshot against human labels (debug/eval/truth.json): grid 672/672
+  cells (100%), ball reads 117/118 (the single miss is a missing circle,
+  not a misread), 28/28 valid cards.
+- **Training corpus committed.** The 28 screenshots + verified ball/card
+  labels are the corpus the bank rebuild will use next; 19 of the 32 seen
+  numbers still have no template row. The interim video-built bank
+  (assets/ball_templates.npz) is coverage-limited and does NOT gate
+  commits - OCR carries the reads.
+
+Regressions: test_v11 19/19, test_v12 7/7; replay baselines re-verified
+(play1 52->54, play2 53->61 events; every diff explained above).
+
 ## Version 1.12
 
 v1.12 fixes the three reliability complaints from live play: normal calls
