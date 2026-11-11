@@ -30,7 +30,7 @@ import vision as V
 from controls import ControlBar
 from overlay import Overlay
 
-VERSION = "1.13"
+VERSION = "1.14"
 
 logging.disable(logging.INFO)
 
@@ -182,6 +182,9 @@ class App:
         self.daubed = B.initial_daubed()
         self.line_counts = B.line_counts(self.daubed)
         self.last_calls: set[tuple[str, int]] = set()
+        self.repeat_warned: set[tuple[str, int]] = set()
+        self.last_multi = False
+        self.last_disagree_log = 0.0
         self.not_on_card: dict[tuple[str, int], float] = {}
         self.last_unread_log = 0.0
         self.current_cells: list[tuple[int, int]] = []
@@ -191,6 +194,7 @@ class App:
         self.pending: tuple[str, int] | None = None
         self.pending_n = 0
         self.pending_t0 = 0.0
+        self.pending_box: tuple[int, int, int, int] | None = None
         self.last_ball_crop = None
         self.overlay_enabled = True
         self.running = True
@@ -691,15 +695,32 @@ class App:
         return V.Grid(x0=g.x0 - dx, y0=g.y0 - dy, x1=g.x1 - dx, y1=g.y1 - dy,
                       xs=[x - dx for x in g.xs], ys=[y - dy for y in g.ys])
 
-    def _handle_ball(self, frame, bbox) -> None:
-        """Read and confirm one normal called ball.
+    def _handle_ball(self, frame, bbox, settled: bool = False) -> None:
+        """Read and confirm one normal called ball (v1.14 policy).
 
-        This path is intentionally biased toward coverage: if the ball can be
-        read reliably once, do not wait for a second poll and risk missing the
-        next call.  Low-confidence reads are still retried instead of guessed.
+        A call commits only after two independent reads on separate
+        captures agree.  v1.12 committed on the first confident read,
+        which trusted mid-entrance animation frames: the ball flies in
+        smeared and semi-transparent, and one confident wrong read became
+        a wrong highlight that never expired.  The diff-gate keeps polling
+        while a call is pending (pending_n != 0), so the confirming read
+        costs one extra poll; coverage is preserved because the ball stays
+        on screen for seconds and unread frames just delay confirmation.
         """
+        # v1.14: a box outside the drawn-ball size band is a still-
+        # entering dot or a fragment box - reading it only manufactures
+        # phantom numbers.  Wait; the ball reaches full size in <0.5 s.
+        cell = (self.grid.x1 - self.grid.x0) / 5.0
+        d = (bbox[2] + bbox[3]) / 2
+        if not (V.BALL_DMIN_F * cell <= d <= V.BALL_DMAX_F * cell):
+            nowt = time.time()
+            if nowt - self.last_disagree_log >= 1.0:
+                self.last_disagree_log = nowt
+                print(f"ball out of size band (d={d:.0f}px) - waiting")
+            self.last_ball_crop = None  # keep polling as it grows
+            return
         ball = V.read_ball_robust(self.engine, frame, bbox,
-                                  min_score=BALL_SCORE)
+                                  min_score=BALL_SCORE, fast=False)
         num = ball["number"]
         if num is None or not (1 <= num <= 75) or ball["number_score"] < BALL_SCORE:
             self.last_ball_crop = None  # retry the read, keep any pending call
@@ -717,18 +738,115 @@ class App:
             self.last_ball_crop = None
             return
         letter = derived
+        ltr = ball.get("letter") or ""
+        if ltr and ball.get("letter_score", 0.0) >= 0.80 \
+                and ltr != letter:
+            # v1.14: the ball's own letter band contradicts the
+            # number's column - the classic clipped-digit misread
+            # (e.g. I17 read as 7).  Corpus measurement: letters are
+            # correct 13/13 at score 1.00 and wrong 0 times, so a
+            # confident contradiction is a misread, never a real ball.
+            # Reject this read; the settled frame re-reads it right.
+            self.last_ball_crop = None
+            nowt = time.time()
+            if nowt - self.last_disagree_log >= 1.0:
+                self.last_disagree_log = nowt
+                print(f"letter/number contradiction ({ltr} vs "
+                      f"{letter} {num}) - read rejected")
+            return
         key = (letter, num)
         if key in self.last_calls:
+            # Bingo never calls the same number twice.  A repeat read is
+            # either the outgoing ball still on screen or a misread of the
+            # new one: never commit it, but never hide it either (v1.14).
+            if key not in self.repeat_warned:
+                self.repeat_warned.add(key)
+                print(f"repeat read {letter} {num} - already called, "
+                      "suppressed (possible misread)")
             self.pending = None
             self.pending_n = 0
+            self.pending_box = None
             return
 
+        if self.pending == key:
+            # Commit on a frame where this ball's own pixels stopped
+            # moving (two mid-animation reads must never ratify each
+            # other; pixel-forensics: that is how B2/N34/B8 phantoms
+            # survived single-frame confirmation).  That pair compares
+            # this poll against the previous poll, so a ball that
+            # lands between two polls reads as "moving" one poll too
+            # long - at a round's end that burned the whole confirm
+            # window (I26 play1 146.8s, O67 play2 152.9s: three
+            # agreeing 1.00 reads each, never ratified).  So also
+            # ratify once this ball has been read identically a
+            # third time AND its box stopped moving between the last
+            # two reads: a sliding or flying ball never holds its box
+            # (measured 10-45px/poll vs <=2px for a docked one), so
+            # mid-motion misreads stay blocked.
+            if settled or (self.pending_n >= 2
+                           and self._ball_docked(bbox)):
+                self.pending = None
+                self.pending_n = 0
+                self.pending_box = None
+                self.commit(letter, num, frame)
+            else:
+                # agreeing, not yet ratifiable: count the read
+                self.pending_n += 1
+                self.pending_box = bbox
+            return
+
+        if self.pending is not None and self.pending != key:
+            nowt = time.time()
+            if nowt - self.last_disagree_log >= 1.0:
+                self.last_disagree_log = nowt
+                p = self.pending
+                print(f"ball reads disagree ({p[0]} {p[1]} vs "
+                      f"{letter} {num}) - trusting neither yet")
         self.pending = key
         self.pending_n = 1
         self.pending_t0 = time.perf_counter()
-        self.last_calls.add(key)
-        self.pending_n = 0
-        self.commit(letter, num, frame)
+        self.pending_box = bbox
+
+    def _ball_settled(self, crop, rx0: int, ry0: int, bbox,
+                      prev_crop) -> bool:
+        """True when this ball's own pixels stopped moving.
+
+        Measured locally on the ball box (plus a small pad) against the
+        previous processed frame, so the cat's idle animation and the
+        ticking timer chips elsewhere in the strip never block a
+        confirming read.
+        """
+        if prev_crop is None or prev_crop.shape != crop.shape:
+            return False
+        bx, by, bw, bh = bbox
+        pad = max(4, int(0.10 * bw))
+        cx0 = max(0, bx - rx0 - pad)
+        cy0 = max(0, by - ry0 - pad)
+        cx1 = min(crop.shape[1], bx - rx0 + bw + pad)
+        cy1 = min(crop.shape[0], by - ry0 + bh + pad)
+        if cx1 <= cx0 or cy1 <= cy0:
+            return False
+        a = crop[cy0:cy1, cx0:cx1]
+        b = prev_crop[cy0:cy1, cx0:cx1]
+        return float(cv2.absdiff(a, b).mean()) < 3.0
+
+    def _ball_docked(self, bbox) -> bool:
+        """True when this ball's box stopped moving since the last read.
+
+        The pixel-settle pair needs the previous poll to already hold
+        the landed ball; a ball that lands mid-interval never gets
+        such a pair.  Box stability is the motion signal that
+        survives that: Hough's box of a docked ball jitters ~2px
+        while a sliding or flying ball moves 10-45px per poll.
+        """
+        if self.pending_box is None or self.grid is None:
+            return False
+        px, py, pw, ph = self.pending_box
+        x, y, w, h = bbox
+        cell = (self.grid.x1 - self.grid.x0) / 5.0
+        return (abs(x - px) <= 0.05 * cell and abs(y - py) <= 0.05 * cell
+                and abs(w - pw) <= 0.10 * cell
+                and abs(h - ph) <= 0.10 * cell)
 
     def _instant_ball_active(self, frame, bboxes=None) -> bool:
         """True only while a real Instant Ball is on screen.
@@ -769,10 +887,23 @@ class App:
 
         if self.last_ball_crop is not None and self.last_ball_crop.shape == crop.shape:
             diff = float(cv2.absdiff(crop, self.last_ball_crop).mean())
+            # v1.14: the whole-crop mean is blind to a ball swap in
+            # the slot - the outgoing and incoming ball cover the
+            # same pixels, so the net change can stay under the gate
+            # while a brand-new call sits unread (probe-measured:
+            # I26 play1 146.3s, O67 play2 152s - both read score
+            # 1.00 for ~0.7 s and were never polled).  The hot-zone
+            # local mean sees the face change directly; the poll is
+            # skipped only when BOTH metrics are quiet.
+            hs = int(0.60 * crop.shape[1])
+            hot = float(cv2.absdiff(crop[:, hs:],
+                                    self.last_ball_crop[:, hs:]).mean())
+            diff = max(diff, hot)
         else:
             diff = 999.0
-        if diff < 3.0 and self.pending_n == 0:
+        if diff < 3.0 and self.pending_n == 0 and not self.last_multi:
             return
+        prev_crop = self.last_ball_crop
         self.last_ball_crop = crop.copy()
 
         # A pink modal whose title physically starts above the card covers
@@ -791,6 +922,7 @@ class App:
             self.last_ball_crop = None  # keep looking every poll
             return
         bboxes = [(b[0] + x0, b[1] + y0, b[2], b[3]) for b in bboxes]
+        self.last_multi = len(bboxes) >= 2
 
         # Instant Ball shows two or three large balls at once.  Do not make
         # the user wait for a second confirming read; these balls disappear.
@@ -808,25 +940,47 @@ class App:
                 if self._check_pick_me_up(frame):
                     return
             if self._instant_ball_active(frame, bboxes):
-                self._poll_instant(frame, bboxes)
+                self._poll_instant(frame, bboxes, crop, x0, y0,
+                                   prev_crop)
                 return
             # Current ball, geometry-validated (v1.13): hot-zone + size band
             # + rightmost.  "Largest wins" read the seated cat blob instead of
             # the real ball in 18/28 files on the labelled corpus.
 
             bbox = V.select_current(bboxes, self.grid)
-            self._handle_ball(frame, bbox)
+            self._handle_ball(frame, bbox,
+                              settled=self._ball_settled(crop, x0, y0,
+                                                         bbox, prev_crop))
             return
 
         bbox = bboxes[0]
-        self._handle_ball(frame, bbox)
+        self._handle_ball(frame, bbox,
+                          settled=self._ball_settled(crop, x0, y0, bbox,
+                                                     prev_crop))
 
-    def _poll_instant(self, frame, bboxes) -> None:
+    def _poll_instant(self, frame, bboxes, crop, rx0: int, ry0: int,
+                      prev_crop) -> None:
         """Read all large balls and show all matching holes together."""
         found = []
         unread = 0
+        gated = 0
+        moving = 0
         max_unread = 0.0
+        cell = (self.grid.x1 - self.grid.x0) / 5.0
         for bbox in bboxes:
+            if not (V.BALL_DMIN_F * cell
+                    <= (bbox[2] + bbox[3]) / 2 <= V.BALL_DMAX_F * cell):
+                gated += 1  # entering dot / fragment: not a ball yet
+                continue
+            if not self._ball_settled(crop, rx0, ry0, bbox, prev_crop):
+                # v1.14: a sliding/docking ball reads garbage (pixel
+                # forensics: B2/N34 play1 37.1s and B8 play2 40.1s
+                # were mid-slide misreads ratified by this path).
+                # Read a box only once its own pixels stopped moving;
+                # the offer layout persists for seconds, so waiting
+                # costs nothing.
+                moving += 1
+                continue
             ball = V.read_ball_robust(self.engine, frame, bbox,
                                       min_score=INSTANT_SCORE)
             num = ball["number"]
@@ -863,6 +1017,11 @@ class App:
                     print(f"instant ball unread (best score "
                           f"{max_unread:.2f}) - retrying")
                 self.last_ball_crop = None
+            elif moving == 0 and gated == 0:
+                # Everything on this settled offer is called/announced
+                # and nothing is still entering or sliding: stop
+                # re-reading it every poll until the strip changes.
+                self.last_multi = False
             return
 
         now = time.time()
@@ -941,6 +1100,7 @@ class App:
         """
         if not self.not_on_card:
             return
+        self.pending_t0 = 0.0  # stale pending would fake the commit ms
         for key in [k for k, t in self.not_on_card.items()
                     if time.time() - t < 30.0]:
             letter, num = key

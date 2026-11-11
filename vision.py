@@ -818,7 +818,8 @@ def read_ball(engine, img, bbox, fast: bool = False):
             "number": number, "number_score": number_sc}
 
 
-def read_ball_robust(engine, img, bbox, min_score: float = 0.90):
+def read_ball_robust(engine, img, bbox, min_score: float = 0.90,
+                     fast: bool = True):
     """Read a ball whose Hough box may be slightly too large.
 
     Instant Ball can draw a coloured banner that makes Hough pick a wider
@@ -832,7 +833,7 @@ def read_ball_robust(engine, img, bbox, min_score: float = 0.90):
     for f in (1.0, 0.92, 0.85, 0.78, 0.70):
         nw, nh = max(4, int(w * f)), max(4, int(h * f))
         bb = (cx - nw // 2, cy - nh // 2, nw, nh)
-        ball = read_ball(engine, img, bb, fast=True)
+        ball = read_ball(engine, img, bb, fast=fast)
         num = ball["number"]
         if num is None or not (1 <= num <= 75) or ball["number_score"] < min_score:
             continue

@@ -6,6 +6,33 @@ Watches the screen, reads the called ball(s), tracks your daubs, and dims the
 Local only. No input injection, no memory reading, no DLL injection, no network.
 The helper never clicks or daubs for you.
 
+## Version 1.14
+
+v1.14 is a reliability overhaul of the ball pipeline, driven by a poll-by-poll
+production trace on both replay videos (tools/_trace_tail.py):
+
+- **Settled-frame confirmation.** Both reads of the two-read confirm must come
+  from a frame where the ball's own pixels stopped moving; the diff gate now
+  uses max(whole-crop, hot-zone) so a same-slot ball swap is always seen; the
+  instant path requires each box settled before reading. This killed every
+  pixel-verified phantom (B4/B3/B7/B1/N34, the B2/N34 sliding-ball garbage at
+  37.10s, B5, B8) with zero real calls lost.
+- **Landing-bounce ratification.** A ball that lands between two polls reads as
+  "moving" one poll too long, and at a round's end that burned the whole
+  confirm window (I26 play1 146.8s, O67 play2 152.9s: three agreeing 1.00
+  reads each, never committed). A third identical read whose Hough box stopped
+  moving (docked jitter <=2px/poll vs 10-45px/poll in flight) now ratifies, so
+  both videos commit every readable ball including the last one before
+  TIME'S UP.
+- **Letter/number contradiction check** in the normal path (contradiction-only;
+  an empty letter band passes).
+- **Dual-read policy unchanged**: OCR primary, template bank agreement-only.
+
+Gates (tools/compare_events.py): the 7 (play1) and 5 (play2) calls lost to v13
+are all pixel-verified phantoms or off-card announce-only diffs; nothing
+gained; daubs identical (13/13, 14/14); v14d -> v14e adds exactly I26@146.84
+and O67@152.92. Regressions: test_v11 19/19, test_v12 7/7.
+
 ## Version 1.13
 
 v1.13 fixes the last false-highlight source found after v1.12: the
