@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 from ctypes import wintypes
 
 import cv2
@@ -195,6 +196,8 @@ class App:
         self.pending_n = 0
         self.pending_t0 = 0.0
         self.pending_box: tuple[int, int, int, int] | None = None
+        self.crash_count = 0
+        self.last_crash_log = 0.0
         self.last_ball_crop = None
         self.overlay_enabled = True
         self.running = True
@@ -1643,7 +1646,7 @@ class App:
 
                 for kid in pump_messages():
                     if kid == 1:
-                        self.detect()
+                        self._safe_detect()
                     elif kid == 2:
                         self.overlay_enabled = not self.overlay_enabled
                         if self.overlay_enabled and self.current_cells:
@@ -1656,7 +1659,7 @@ class App:
 
                 if self.rescan_requested:
                     self.rescan_requested = False
-                    self.detect()
+                    self._safe_detect()
 
                 if not self.running:
                     break
@@ -1667,7 +1670,7 @@ class App:
 
                 if self.grid is None:
                     if time.time() - self.last_detect_try > 0.6:
-                        self.detect(quiet=self.detect_fail > 0)
+                        self._safe_detect(quiet=self.detect_fail > 0)
                     time.sleep(0.05)
                     continue
 
@@ -1679,14 +1682,44 @@ class App:
                         break
                     frame = self.grab()
                     if frame is not None:
-                        self._confirm_pending(frame)
-                        self.check_round(frame)
-                        self.poll_ball(frame)
+                        self._poll_once(frame)
                 time.sleep(0.03)
         except KeyboardInterrupt:
             pass
         finally:
             self.cleanup()
+
+    def _guard_log(self) -> None:
+        self.crash_count += 1
+        nowt = time.time()
+        if nowt - self.last_crash_log >= 1.0:
+            self.last_crash_log = nowt
+            print(f"engine error on frame #{self.crash_count} - frame skipped, still watching:")
+            traceback.print_exc()
+
+    def _poll_once(self, frame) -> None:
+        """One production tick, fault-isolated.
+
+        bingo.log records 8 mid-game process deaths from exactly
+        this class (OCR garbage hitting a parse, one old
+        NameError): the exception escaped the loop, the app died,
+        and the user kept playing unprotected during the re-scan.
+        One bad frame must never kill the watcher: log it, skip
+        the frame, keep watching.
+        """
+        try:
+            self._confirm_pending(frame)
+            self.check_round(frame)
+            self.poll_ball(frame)
+        except Exception:
+            self._guard_log()
+
+    def _safe_detect(self, quiet: bool = False) -> None:
+        """detect() with the same per-call fault isolation."""
+        try:
+            self.detect(quiet=quiet)
+        except Exception:
+            self._guard_log()
 
     def cleanup(self) -> None:
         for kid in (1, 2, 3):

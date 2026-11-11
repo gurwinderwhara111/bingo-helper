@@ -26,6 +26,14 @@ production trace on both replay videos (tools/_trace_tail.py):
   TIME'S UP.
 - **Letter/number contradiction check** in the normal path (contradiction-only;
   an empty letter band passes).
+- **Per-frame fault isolation.** bingo.log recorded 8 mid-game process
+  deaths from one class: an unexpected exception (OCR garbage `'²'`/`'�'`/
+  `'?3'` hitting a parse, one old NameError) escaped the watch loop and
+  killed the app; play continued unprotected during every re-scan. The
+  card/ball readers already filter OCR text to ASCII digits; the loop now
+  also isolates every frame (`_poll_once`) and every `detect()` call, logs
+  the traceback, and keeps watching. One bad frame can no longer kill the
+  helper.
 - **Dual-read policy unchanged**: OCR primary, template bank agreement-only.
 
 Gates (tools/compare_events.py): the 7 (play1) and 5 (play2) calls lost to v13
